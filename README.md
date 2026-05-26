@@ -53,6 +53,9 @@ DIAN_BINARY_SECURITY_TOKEN=tu_certificado_x509_en_base64
 # Configuración de Servidor
 PORT=8080
 RUST_LOG=info
+
+# Límites de Concurrencia del Worker
+MAX_CONCURRENT_JOBS=5
 ```
 
 ### Paso 3: Compilar y Ejecutar
@@ -180,6 +183,100 @@ El sistema generará la ApplicationResponse (UBL 2.1), calculará el hash CUDE (
 
 ---
 
-## 5. Licencia
+### E. Emisión de Nómina Electrónica
+
+Envía reportes de nómina individual a la DIAN.
+
+*   **Endpoint:** `POST /api/v1/payroll`
+*   **Payload JSON:**
+```json
+{
+  "prefix": "NOM",
+  "number": 101,
+  "issue_date": "2026-05-26",
+  "issue_time": "08:00:00",
+  "employer_nit": "900123456",
+  "employer_name": "Tu Empresa SAS",
+  "employee_id_type": "13",
+  "employee_id": "10203040",
+  "employee_name": "Trabajador Ejemplar",
+  "devengado": 1500000.00,
+  "deducido": 60000.00,
+  "total": 1440000.00,
+  "software_pin": "pin_test",
+  "environment": "2"
+}
+```
+
+*   **Respuesta (HTTP 202 Accepted):** Retorna `document_id` y encola el trabajo en Redis, calculando el CUNE (SHA-384) y firmando el reporte en segundo plano.
+
+---
+
+### F. Emisión de Documento Soporte
+
+Registra transacciones de compras realizadas a sujetos no obligados a facturar.
+
+*   **Endpoint:** `POST /api/v1/support-documents`
+*   **Payload JSON:**
+```json
+{
+  "prefix": "DS",
+  "number": 0,
+  "issue_date": "2026-05-26",
+  "issue_time": "10:30:00-05:00",
+  "seller_nit": "10203040",
+  "seller_name": "Proveedor No Obligado",
+  "buyer_nit": "900123456",
+  "buyer_name": "Tu Empresa SAS",
+  "net_amount": 100000.00,
+  "tax_amount": 19000.00,
+  "total_amount": 119000.00,
+  "software_pin": "pin_test",
+  "environment": "2"
+}
+```
+
+*   **Respuesta (HTTP 202 Accepted):** El servidor reserva el consecutivo atómico (ej: 200) y responde:
+```json
+{
+  "document_id": "673f4e2b-f119-4a94-87cf-45de09bc8720",
+  "document_number": 200,
+  "status": "QUEUED",
+  "message": "Documento soporte reservado y encolado correctamente"
+}
+```
+
+---
+
+### G. Monitoreo y Diagnóstico (Health Check)
+
+Permite consultar el estado operativo de las dependencias clave.
+
+*   **Endpoint:** `GET /api/v1/health` (Acceso público, no requiere API Key)
+*   **Respuesta (HTTP 200 OK):**
+```json
+{
+  "status": "UP",
+  "database": "CONNECTED",
+  "redis": "CONNECTED"
+}
+```
+
+---
+
+## 5. Arquitectura de Numeración Concurrente y Resiliencia
+
+El motor incluye optimizaciones avanzadas para prevenir fallos bajo alta concurrencia y garantizar la secuencia de numeración exigida por la DIAN:
+
+1.  **Bloqueo Pesimista Corto (`SELECT ... FOR UPDATE`)**:
+    Los endpoints `POST /api/v1/invoices`, `POST /api/v1/payroll` y `POST /api/v1/support-documents` inician una transacción corta de base de datos y bloquean de forma exclusiva la fila del rango de numeración del Tenant. El consecutivo es validado e incrementado de forma segura, y la transacción se confirma (`commit`) inmediatamente. Esto libera los locks en menos de `10ms`, mucho antes de iniciar operaciones de red lentas con Redis o SOAP de la DIAN.
+2.  **Control de Concurrencia de Transmisión**:
+    El background worker (`worker-redis`) utiliza un semáforo asíncrono (`tokio::sync::Semaphore`) limitado por `MAX_CONCURRENT_JOBS` para controlar el número de peticiones SOAP enviadas en paralelo a la DIAN. Esto evita sobrecargar la red y previene timeouts.
+3.  **Monitoreo Proactivo**:
+    El worker chequea la salud de PostgreSQL y Redis antes de de-encolar nuevos trabajos, transicionando a esperas con backoff si alguna dependencia crítica se desconecta.
+
+---
+
+## 6. Licencia
 
 Este proyecto está bajo los términos de la licencia **Apache License 2.0**. Para más detalles, consulta el archivo [LICENSE](LICENSE).
