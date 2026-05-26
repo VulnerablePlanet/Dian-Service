@@ -1,0 +1,23 @@
+[package]
+name = "worker-redis"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "worker-redis"
+path = "src/main.rs"
+
+[dependencies]
+core-domain = { path = "../core-domain" }
+ubl-engine = { path = "../ubl-engine" }
+crypto-signer = { path = "../crypto-signer" }
+dian-soap-client = { path = "../dian-soap-client" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+rand = "0.8"

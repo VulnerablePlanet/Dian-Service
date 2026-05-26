@@ -1,0 +1,31 @@
+[package]
+name = "api-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "api-server"
+path = "src/main.rs"
+
+[dependencies]
+core-domain = { path = "../core-domain" }
+ubl-engine = { path = "../ubl-engine" }
+crypto-signer = { path = "../crypto-signer" }
+dian-soap-client = { path = "../dian-soap-client" }
+worker-redis = { path = "../worker-redis" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+validator = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }

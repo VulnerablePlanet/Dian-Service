@@ -1,0 +1,151 @@
+use crate::error::UblError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoicePayload {
+    pub prefix: String,
+    pub number: i32,
+    pub issue_date: String,      // YYYY-MM-DD
+    pub issue_time: String,      // HH:MM:SS-05:00
+    pub company_nit: String,     // NIT emisor sin puntos ni DV (ej: 900123456)
+    pub company_name: String,
+    pub customer_id_type: String, // Tipo de identificación del adquirente (ej: 31 = NIT, 13 = Cédula)
+    pub customer_id: String,     // Identificación del adquirente
+    pub customer_name: String,
+    pub customer_email: String,
+    pub net_amount: f64,
+    pub tax_amount: f64,
+    pub total_amount: f64,
+    pub environment: String,      // "1" = Producción, "2" = Habilitación/Pruebas
+    pub technical_key: String,    // Clave técnica (para facturas) o Software PIN (para notas)
+    pub document_type: String,    // "invoice", "credit_note", "debit_note"
+    #[serde(default)]
+    pub test_set_id: Option<String>,
+}
+
+impl InvoicePayload {
+    pub fn validate(&self) -> Result<(), UblError> {
+        // 1. Validar formato de fecha (YYYY-MM-DD)
+        if self.issue_date.len() != 10
+            || !self.issue_date.chars().nth(4).map_or(false, |c| c == '-')
+            || !self.issue_date.chars().nth(7).map_or(false, |c| c == '-')
+        {
+            return Err(UblError::Validation(
+                "La fecha debe tener el formato YYYY-MM-DD".to_string(),
+            ));
+        }
+
+        // 2. Validar formato de hora con zona horaria (HH:MM:SS-05:00)
+        // Ejemplo: 10:42:00-05:00
+        if self.issue_time.len() != 14
+            || !self.issue_time.chars().nth(2).map_or(false, |c| c == ':')
+            || !self.issue_time.chars().nth(5).map_or(false, |c| c == ':')
+            || !self.issue_time.chars().nth(8).map_or(false, |c| c == '-')
+        {
+            return Err(UblError::Validation(
+                "La hora debe tener el formato HH:MM:SS-05:00".to_string(),
+            ));
+        }
+
+        // 3. Validar NIT de emisor (numérico)
+        if self.company_nit.is_empty() || !self.company_nit.chars().all(|c| c.is_ascii_digit()) {
+            return Err(UblError::Validation(
+                "El NIT de la empresa debe ser únicamente numérico (sin puntos ni dígito de verificación)".to_string(),
+            ));
+        }
+
+        // 4. Validar adquirente
+        if self.customer_id.is_empty() {
+            return Err(UblError::Validation(
+                "La identificación del adquiriente no puede estar vacía".to_string(),
+            ));
+        }
+
+        // 5. Validar correo electrónico básico
+        if !self.customer_email.contains('@') {
+            return Err(UblError::Validation(
+                "El correo del adquiriente debe ser válido".to_string(),
+            ));
+        }
+
+        // 6. Validar montos positivos
+        if self.net_amount < 0.0 || self.tax_amount < 0.0 || self.total_amount < 0.0 {
+            return Err(UblError::Validation(
+                "Los montos del documento no pueden ser negativos".to_string(),
+            ));
+        }
+
+        // 7. Validar tipo de documento
+        match self.document_type.as_str() {
+            "invoice" | "credit_note" | "debit_note" => {}
+            _ => {
+                return Err(UblError::Validation(
+                    "Tipo de documento inválido. Debe ser 'invoice', 'credit_note' o 'debit_note'".to_string(),
+                ));
+            }
+        }
+
+        // 8. Validar ambiente
+        if self.environment != "1" && self.environment != "2" {
+            return Err(UblError::Validation(
+                "El ambiente debe ser '1' (producción) o '2' (habilitación)".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mock_payload() -> InvoicePayload {
+        InvoicePayload {
+            prefix: "FE".to_string(),
+            number: 1002,
+            issue_date: "2026-05-23".to_string(),
+            issue_time: "10:42:00-05:00".to_string(),
+            company_nit: "900123456".to_string(),
+            company_name: "Empresa Emisora".to_string(),
+            customer_id_type: "31".to_string(),
+            customer_id: "900999888".to_string(),
+            customer_name: "Cliente Receptor".to_string(),
+            customer_email: "cliente@receptor.com".to_string(),
+            net_amount: 1000.0,
+            tax_amount: 190.0,
+            total_amount: 1190.0,
+            environment: "2".to_string(),
+            technical_key: "clave_tecnica".to_string(),
+            document_type: "invoice".to_string(),
+            test_set_id: None,
+        }
+    }
+
+    #[test]
+    fn test_valid_payload() {
+        let payload = mock_payload();
+        assert!(payload.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_date() {
+        let mut payload = mock_payload();
+        payload.issue_date = "23-05-2026".to_string();
+        assert!(payload.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_time() {
+        let mut payload = mock_payload();
+        payload.issue_time = "10:42:00".to_string();
+        assert!(payload.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_nit() {
+        let mut payload = mock_payload();
+        payload.company_nit = "900.123.456-7".to_string();
+        assert!(payload.validate().is_err());
+    }
+}

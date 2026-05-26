@@ -1,0 +1,12 @@
+[package]
+name = "ubl-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-domain = { path = "../core-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+minijinja = { workspace = true }
+thiserror = { workspace = true }

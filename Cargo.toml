@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "core-domain",
+    "ubl-engine",
+    "crypto-signer",
+    "dian-soap-client",
+    "worker-redis",
+    "api-server",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+async-trait = "0.1"
+sha2 = "0.10"
+minijinja = { version = "1.0", features = ["loader"] }
+xml-canonicalization = "0.1.1"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+ring = "0.17"
+rsa = "0.9"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+validator = { version = "0.18", features = ["derive"] }
+hmac = "0.12.1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+opentelemetry = "0.22"
