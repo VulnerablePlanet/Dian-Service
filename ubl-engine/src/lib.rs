@@ -3,9 +3,9 @@ pub mod error;
 pub mod payload;
 pub mod templates;
 
-use cufe::calculate_cufe_cude;
+use cufe::{calculate_cufe_cude, calculate_cune, calculate_cuds};
 use error::UblError;
-use payload::InvoicePayload;
+use payload::{InvoicePayload, PayrollPayload, SupportDocumentPayload};
 use templates::TemplateEngine;
 
 /// Genera el XML UBL 2.1 base y calcula el CUFE para una factura.
@@ -15,8 +15,6 @@ pub fn generate_invoice_xml(payload: &InvoicePayload) -> Result<(String, String)
     payload.validate()?;
 
     // 2. Calcular el CUFE/CUDE usando SHA-384
-    // Para simplificar bajo el Anexo 1.9, asumimos por defecto IVA ("01") con el tax_amount,
-    // y dejamos INC ("04") e ICA ("03") en 0.00.
     let cufe = calculate_cufe_cude(
         &format!("{}{}", payload.prefix, payload.number),
         &payload.issue_date,
@@ -142,6 +140,84 @@ pub fn generate_application_response_xml(
     Ok((xml, cude))
 }
 
+/// Genera el XML de Nomina Electronica y calcula el CUNE.
+pub fn generate_payroll_xml(payload: &PayrollPayload) -> Result<(String, String), UblError> {
+    payload.validate()?;
+
+    // Por defecto Nomina Individual con TipoXML = "102"
+    let cune = calculate_cune(
+        &format!("{}{}", payload.prefix, payload.number),
+        &payload.issue_date,
+        &payload.issue_time,
+        payload.devengado,
+        payload.deducido,
+        payload.total,
+        &payload.employer_nit,
+        &payload.employee_id,
+        "102",
+        &payload.software_pin,
+        &payload.environment,
+    );
+
+    let engine = TemplateEngine::new();
+    let xml = engine.render_payroll(
+        &payload.prefix,
+        payload.number,
+        &cune,
+        &payload.issue_date,
+        &payload.issue_time,
+        &payload.employer_nit,
+        &payload.employer_name,
+        &payload.employee_id,
+        &payload.employee_name,
+        payload.devengado,
+        payload.deducido,
+        payload.total,
+    )?;
+
+    Ok((xml, cune))
+}
+
+/// Genera el XML de Documento Soporte y calcula el CUDS.
+pub fn generate_support_document_xml(payload: &SupportDocumentPayload) -> Result<(String, String), UblError> {
+    payload.validate()?;
+
+    // Codigo de impuesto por defecto IVA = "01" (con valor tax_amount) o "00" (sin impuesto)
+    let cod_imp = if payload.tax_amount > 0.0 { "01" } else { "00" };
+
+    let cuds = calculate_cuds(
+        &format!("{}{}", payload.prefix, payload.number),
+        &payload.issue_date,
+        &payload.issue_time,
+        payload.net_amount,
+        cod_imp,
+        payload.tax_amount,
+        payload.total_amount,
+        &payload.seller_nit,
+        &payload.buyer_nit,
+        &payload.software_pin,
+        &payload.environment,
+    );
+
+    let engine = TemplateEngine::new();
+    let xml = engine.render_support_document(
+        &payload.prefix,
+        payload.number,
+        &cuds,
+        &payload.issue_date,
+        &payload.issue_time,
+        &payload.seller_nit,
+        &payload.seller_name,
+        &payload.buyer_nit,
+        &payload.buyer_name,
+        payload.net_amount,
+        payload.tax_amount,
+        payload.total_amount,
+    )?;
+
+    Ok((xml, cuds))
+}
+
 
 
 #[cfg(test)]
@@ -256,5 +332,63 @@ mod tests {
         assert!(xml.contains("Acuse de recibo de Factura Electronica"));
         assert!(xml.contains("FE1002"));
         assert!(xml.contains("my_invoice_cufe"));
+    }
+
+    #[test]
+    fn test_generate_payroll_xml_success() {
+        let p = PayrollPayload {
+            prefix: "NOM".to_string(),
+            number: 101,
+            issue_date: "2026-05-26".to_string(),
+            issue_time: "08:00:00".to_string(),
+            employer_nit: "900123456".to_string(),
+            employer_name: "Empresa Emisora".to_string(),
+            employee_id_type: "13".to_string(),
+            employee_id: "10203040".to_string(),
+            employee_name: "Trabajador".to_string(),
+            devengado: 1500000.00,
+            deducido: 60000.00,
+            total: 1440000.00,
+            software_pin: "pin_test".to_string(),
+            environment: "2".to_string(),
+        };
+
+        let result = generate_payroll_xml(&p);
+        assert!(result.is_ok());
+        let (xml, cune) = result.unwrap();
+        assert_eq!(cune.len(), 96);
+        assert!(xml.contains("<NominaIndividual"));
+        assert!(xml.contains(&cune));
+        assert!(xml.contains("1500000.00"));
+        assert!(xml.contains("60000.00"));
+    }
+
+    #[test]
+    fn test_generate_support_document_xml_success() {
+        let sd = SupportDocumentPayload {
+            prefix: "DS".to_string(),
+            number: 200,
+            issue_date: "2026-05-26".to_string(),
+            issue_time: "10:30:00-05:00".to_string(),
+            seller_nit: "10203040".to_string(),
+            seller_name: "Vendedor No Obligado".to_string(),
+            buyer_nit: "900123456".to_string(),
+            buyer_name: "Comprador SAS".to_string(),
+            net_amount: 100000.00,
+            tax_amount: 19000.00,
+            total_amount: 119000.00,
+            software_pin: "pin_test".to_string(),
+            environment: "2".to_string(),
+        };
+
+        let result = generate_support_document_xml(&sd);
+        assert!(result.is_ok());
+        let (xml, cuds) = result.unwrap();
+        assert_eq!(cuds.len(), 96);
+        assert!(xml.contains("<Invoice"));
+        assert!(xml.contains("<cbc:CustomizationID>05</cbc:CustomizationID>"));
+        assert!(xml.contains(&cuds));
+        assert!(xml.contains("100000.00"));
+        assert!(xml.contains("19000.00"));
     }
 }

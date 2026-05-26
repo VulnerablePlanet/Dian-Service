@@ -13,9 +13,13 @@ use error::WorkerError;
 use queue::{Job, RedisQueue};
 use std::sync::Arc;
 use std::time::Duration;
-use ubl_engine::generate_invoice_xml;
+use ubl_engine::{generate_invoice_xml, generate_payroll_xml, generate_support_document_xml};
 use ubl_engine::payload::InvoicePayload;
 use uuid::Uuid;
+use sqlx::postgres::PgPoolOptions;
+use dian_soap_client::client::DianSoapClientImpl;
+use core_domain::repository::PgDocumentRepository;
+use tokio::sync::Semaphore;
 
 pub struct DocumentProcessor {
     repo: Arc<dyn DocumentRepository>,
@@ -98,9 +102,11 @@ impl DocumentProcessor {
                             self.repo.save_document(&document).await?;
 
                             // Generar, firmar y notificar AttachedDocument (contenedor electrónico)
-                            if let Some(ref resp_xml) = dian_resp.xml_response {
-                                if let Err(err) = self.process_attached_document(&document, &payload, resp_xml).await {
-                                    println!("[AttachedDocument Error] Failed to generate: {:?}", err);
+                            if document.document_type == DocumentType::Invoice {
+                                if let Some(ref resp_xml) = dian_resp.xml_response {
+                                    if let Err(err) = self.process_attached_document(&document, &payload, resp_xml).await {
+                                        println!("[AttachedDocument Error] Failed to generate: {:?}", err);
+                                    }
                                 }
                             }
 
@@ -172,24 +178,36 @@ impl DocumentProcessor {
             return Ok(());
         }
 
-        // 3. Generar XML UBL 2.1 base
-        let payload: InvoicePayload = serde_json::from_value(document.payload.clone())
-            .map_err(|e| WorkerError::Internal(format!("Invalid document payload JSON: {}", e)))?;
-        
-        let (unsigned_xml, cufe) = match generate_invoice_xml(&payload) {
-            Ok(res) => res,
-            Err(e) => {
-                // Error de validación local -> No reintentamos, marcamos como rechazado
-                println!("[Validation Error] Rechazando documento {}: {}", document.id, e);
-                document.status = DocumentStatus::DianRejected;
-                self.repo.save_document(&document).await?;
-                self.queue.ack(&job).await?;
-                return Ok(());
+        // 3. Generar XML UBL 2.1 base y extraer metadatos según el tipo de documento
+        let (unsigned_xml, cufe_cude, company_nit, prefix, number, is_hab, test_set_id) = match document.document_type {
+            DocumentType::Invoice => {
+                let payload: InvoicePayload = serde_json::from_value(document.payload.clone())
+                    .map_err(|e| WorkerError::Internal(format!("Invalid invoice payload JSON: {}", e)))?;
+                let (xml, cufe) = ubl_engine::generate_invoice_xml(&payload)
+                    .map_err(|e| WorkerError::Internal(format!("Invoice generation failed: {}", e)))?;
+                let is_hab = payload.environment == "2";
+                (xml, cufe, payload.company_nit.clone(), payload.prefix.clone(), payload.number, is_hab, payload.test_set_id.clone())
+            }
+            DocumentType::Payroll => {
+                let payload: ubl_engine::payload::PayrollPayload = serde_json::from_value(document.payload.clone())
+                    .map_err(|e| WorkerError::Internal(format!("Invalid payroll payload JSON: {}", e)))?;
+                let (xml, cune) = ubl_engine::generate_payroll_xml(&payload)
+                    .map_err(|e| WorkerError::Internal(format!("Payroll generation failed: {}", e)))?;
+                let is_hab = payload.environment == "2";
+                (xml, cune, payload.employer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None)
+            }
+            DocumentType::SupportDocument => {
+                let payload: ubl_engine::payload::SupportDocumentPayload = serde_json::from_value(document.payload.clone())
+                    .map_err(|e| WorkerError::Internal(format!("Invalid support document payload JSON: {}", e)))?;
+                let (xml, cuds) = ubl_engine::generate_support_document_xml(&payload)
+                    .map_err(|e| WorkerError::Internal(format!("Support document generation failed: {}", e)))?;
+                let is_hab = payload.environment == "2";
+                (xml, cuds, payload.buyer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None)
             }
         };
 
         // Guardar CUFE/CUDE y XML original
-        document.cufe_cude = cufe;
+        document.cufe_cude = cufe_cude;
         document.original_xml = Some(unsigned_xml.clone());
 
         // 4. Firmar el XML (XAdES-EPES)
@@ -212,9 +230,9 @@ impl DocumentProcessor {
         // 5. Comprimir a ZIP
         let (zip_bytes, _zip_filename) = match dian_soap_client::zip::compress_xml_to_zip(
             &signed_xml,
-            &payload.company_nit,
-            &payload.prefix,
-            payload.number,
+            &company_nit,
+            &prefix,
+            number,
         ) {
             Ok(res) => res,
             Err(e) => {
@@ -224,10 +242,10 @@ impl DocumentProcessor {
         };
 
         // 6. Transmisión SOAP a la DIAN
-        let is_hab = payload.environment == "2";
+        let is_hab = is_hab;
         
         // Si el payload contiene un test_set_id, ejecutamos la transmisión asíncrona de habilitación
-        if let Some(ref test_set_id) = payload.test_set_id {
+        if let Some(ref test_set_id) = test_set_id {
             println!("[Transmitting] Enviando set de pruebas asincrono (test_set_id: {}) para {}", test_set_id, document.id);
             match self.soap_client.send_test_set_async(&zip_bytes, test_set_id, is_hab).await {
                 Ok(zip_key) => {
@@ -315,9 +333,13 @@ impl DocumentProcessor {
                 self.repo.save_document(&document).await?;
 
                 if is_accepted {
-                    if let Some(ref resp_xml) = dian_resp.xml_response {
-                        if let Err(err) = self.process_attached_document(&document, &payload, resp_xml).await {
-                            println!("[AttachedDocument Error] Failed to generate: {:?}", err);
+                    if document.document_type == DocumentType::Invoice {
+                        if let Some(ref resp_xml) = dian_resp.xml_response {
+                            let payload: InvoicePayload = serde_json::from_value(document.payload.clone())
+                                .map_err(|e| WorkerError::Internal(format!("Invalid invoice payload JSON: {}", e)))?;
+                            if let Err(err) = self.process_attached_document(&document, &payload, resp_xml).await {
+                                println!("[AttachedDocument Error] Failed to generate: {:?}", err);
+                            }
                         }
                     }
                 }
@@ -442,8 +464,117 @@ impl DocumentProcessor {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Iniciando worker-redis...");
+
+    // 1. Conectar a PostgreSQL
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/dian".to_string());
+    
+    let db_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to PostgreSQL in worker-redis");
+
+    // 2. Conectar a Redis
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    
+    let redis_client = redis::Client::open(redis_url.clone())
+        .expect("Failed to open Redis client in worker-redis");
+
+    let queue = Arc::new(RedisQueue::new(&redis_url, "dian_jobs")?);
+
+    // 3. Inicializar componentes
+    let repo = Arc::new(PgDocumentRepository::new(db_pool.clone()));
+    
+    let binary_security_token = std::env::var("DIAN_BINARY_SECURITY_TOKEN")
+        .unwrap_or_else(|_| "token_dummy".to_string());
+    
+    let soap_client = Arc::new(DianSoapClientImpl::new(binary_security_token, None, None));
+    
+    let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
+    
+    let max_attempts = 3;
+    let processor = Arc::new(DocumentProcessor::new(
+        repo,
+        soap_client,
+        queue.clone(),
+        cb,
+        max_attempts,
+    ));
+
+    // 4. Configurar Semáforo de Concurrencia
+    let max_concurrent_jobs: usize = std::env::var("MAX_CONCURRENT_JOBS")
+        .unwrap_or_else(|_| "5".to_string())
+        .parse()
+        .unwrap_or(5);
+    
+    let sem = Arc::new(Semaphore::new(max_concurrent_jobs));
+
+    println!("Worker-redis listo. Escuchando cola 'dian_jobs' con concurrencia max de {}...", max_concurrent_jobs);
+
+    // 5. Bucle principal con control de concurrencia y health checks de bases de datos
+    loop {
+        // Chequeos de salud de PostgreSQL y Redis
+        let mut healthy = true;
+        if let Err(e) = sqlx::query("SELECT 1").execute(&db_pool).await {
+            eprintln!("[Health Check ERROR] PostgreSQL is down: {:?}. Retrying in 5 seconds...", e);
+            healthy = false;
+        }
+        
+        match redis_client.get_async_connection().await {
+            Ok(mut conn) => {
+                let ping_res: Result<(), _> = redis::cmd("PING").query_async(&mut conn).await;
+                if let Err(e) = ping_res {
+                    eprintln!("[Health Check ERROR] Redis PING failed: {:?}. Retrying in 5 seconds...", e);
+                    healthy = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("[Health Check ERROR] Redis connection failed: {:?}. Retrying in 5 seconds...", e);
+                healthy = false;
+            }
+        }
+
+        if !healthy {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        // Adquirir permiso del semáforo antes de de-encolar para no saturar
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        // Extraer trabajo
+        match queue.dequeue_blocking(5.0).await {
+            Ok(Some(job)) => {
+                let processor = processor.clone();
+                tokio::spawn(async move {
+                    // Mantener el permiso retenido hasta que termine la tarea
+                    let _permit = permit;
+                    if let Err(e) = processor.process_job(job).await {
+                        eprintln!("[Job Error] Failed to process job: {:?}", e);
+                    }
+                });
+            }
+            Ok(None) => {
+                // No hay trabajos, el timeout de BRPOPLPUSH expiró. Liberar el permiso y volver a intentar.
+                drop(permit);
+            }
+            Err(e) => {
+                eprintln!("[Queue Error] Error pulling job from queue: {:?}", e);
+                drop(permit);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -606,6 +737,123 @@ mod tests {
         // Since no Redis is running locally, we expect a Redis network error,
         // but the DB should have been updated with the signed XML and status.
         assert!(result.is_err());
+        assert!(*saved_flag.lock().unwrap());
+        let doc_after = document_shared.lock().unwrap();
+        assert_eq!(doc_after.status, DocumentStatus::Pending);
+        assert!(!doc_after.cufe_cude.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_payroll_job_success() {
+        let doc_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "prefix": "NOM",
+            "number": 101,
+            "issue_date": "2026-05-26",
+            "issue_time": "08:00:00",
+            "employer_nit": "900123456",
+            "employer_name": "Empresa Emisora",
+            "employee_id_type": "13",
+            "employee_id": "10203040",
+            "employee_name": "Trabajador",
+            "devengado": 1500000.0,
+            "deducido": 60000.0,
+            "total": 1440000.0,
+            "software_pin": "pin_test",
+            "environment": "2"
+        });
+
+        let document = Document {
+            id: doc_id,
+            tenant_id: Uuid::new_v4(),
+            document_type: DocumentType::Payroll,
+            prefix: "NOM".to_string(),
+            document_number: 101,
+            cufe_cude: "".to_string(),
+            payload,
+            original_xml: None,
+            signed_xml: None,
+            pdf_url: None,
+            status: DocumentStatus::Draft,
+            created_at: chrono::Utc::now(),
+        };
+
+        let document_shared = Arc::new(StdMutex::new(document));
+        let saved_flag = Arc::new(StdMutex::new(false));
+        
+        let repo = Arc::new(MockRepository {
+            document: document_shared.clone(),
+            saved: saved_flag.clone(),
+        });
+
+        let soap_client = Arc::new(MockSoapClient { should_fail: false });
+        let queue = Arc::new(RedisQueue::new("redis://127.0.0.1:6379", "test_queue").unwrap());
+        let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
+
+        let processor = DocumentProcessor::new(repo, soap_client, queue, cb, 3);
+        let job = Job { document_id: doc_id, attempt: 1 };
+        
+        let result = processor.process_job(job).await;
+        
+        assert!(result.is_err()); // Redis error expected
+        assert!(*saved_flag.lock().unwrap());
+        let doc_after = document_shared.lock().unwrap();
+        assert_eq!(doc_after.status, DocumentStatus::Pending);
+        assert!(!doc_after.cufe_cude.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_support_document_job_success() {
+        let doc_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "prefix": "DS",
+            "number": 200,
+            "issue_date": "2026-05-26",
+            "issue_time": "10:30:00-05:00",
+            "seller_nit": "10203040",
+            "seller_name": "Vendedor No Obligado",
+            "buyer_nit": "900123456",
+            "buyer_name": "Comprador SAS",
+            "net_amount": 100000.0,
+            "tax_amount": 19000.0,
+            "total_amount": 119000.0,
+            "software_pin": "pin_test",
+            "environment": "2"
+        });
+
+        let document = Document {
+            id: doc_id,
+            tenant_id: Uuid::new_v4(),
+            document_type: DocumentType::SupportDocument,
+            prefix: "DS".to_string(),
+            document_number: 200,
+            cufe_cude: "".to_string(),
+            payload,
+            original_xml: None,
+            signed_xml: None,
+            pdf_url: None,
+            status: DocumentStatus::Draft,
+            created_at: chrono::Utc::now(),
+        };
+
+        let document_shared = Arc::new(StdMutex::new(document));
+        let saved_flag = Arc::new(StdMutex::new(false));
+        
+        let repo = Arc::new(MockRepository {
+            document: document_shared.clone(),
+            saved: saved_flag.clone(),
+        });
+
+        let soap_client = Arc::new(MockSoapClient { should_fail: false });
+        let queue = Arc::new(RedisQueue::new("redis://127.0.0.1:6379", "test_queue").unwrap());
+        let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
+
+        let processor = DocumentProcessor::new(repo, soap_client, queue, cb, 3);
+        let job = Job { document_id: doc_id, attempt: 1 };
+        
+        let result = processor.process_job(job).await;
+        
+        assert!(result.is_err()); // Redis error expected
         assert!(*saved_flag.lock().unwrap());
         let doc_after = document_shared.lock().unwrap();
         assert_eq!(doc_after.status, DocumentStatus::Pending);

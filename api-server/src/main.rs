@@ -1,4 +1,4 @@
-use api_server::handlers::{create_invoice, get_document};
+use api_server::handlers::{create_invoice, get_document, create_payroll, create_support_document, health_check};
 use api_server::events::{receive_inbound_invoice, register_document_event};
 use api_server::middleware::auth_middleware;
 use api_server::telemetry::init_telemetry;
@@ -37,16 +37,22 @@ async fn main() {
     let shared_state = (pool.clone(), redis_client);
 
     // 4. Configurar Enrutamiento y Middleware
+    let health_route = Router::new()
+        .route("/health", get(health_check))
+        .with_state(shared_state.clone());
+
     let api_routes = Router::new()
         .route("/invoices", post(create_invoice))
         .route("/documents/:id", get(get_document))
         .route("/inbound/invoices", post(receive_inbound_invoice))
         .route("/documents/:id/events", post(register_document_event))
+        .route("/payroll", post(create_payroll))
+        .route("/support-documents", post(create_support_document))
         .layer(from_fn_with_state(pool, auth_middleware))
         .with_state(shared_state)
         .layer(TraceLayer::new_for_http());
 
-    let app = Router::new().nest("/api/v1", api_routes);
+    let app = Router::new().nest("/api/v1", api_routes.merge(health_route));
 
     // 5. Iniciar Servidor
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
