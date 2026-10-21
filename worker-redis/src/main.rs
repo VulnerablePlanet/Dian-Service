@@ -204,6 +204,13 @@ impl DocumentProcessor {
                 let is_hab = payload.environment == "2";
                 (xml, cuds, payload.buyer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None)
             }
+            DocumentType::CreditNote | DocumentType::DebitNote => {
+                self.queue.ack(&job).await?;
+                return Err(WorkerError::Internal(format!(
+                    "Document type {:?} is not supported yet",
+                    document.document_type
+                )));
+            }
         };
 
         // Guardar CUFE/CUDE y XML original

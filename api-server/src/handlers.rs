@@ -160,6 +160,7 @@ pub async fn get_document(
     )
     .bind(doc_id)
     .bind(tenant.id)
+    .fetch_optional(&pool)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("Documento {} no encontrado", doc_id)))?;
 
@@ -309,14 +310,14 @@ pub async fn create_support_document(
     let doc_id = Uuid::new_v4();
     let mut tx = pool.begin().await?;
 
-    let range = sqlx::query!(
+    let range_row = sqlx::query(
         "SELECT id, current_counter, to_number 
          FROM numbering_ranges 
          WHERE tenant_id = $1 AND document_type = 'support_document' AND prefix = $2 
-         FOR UPDATE",
-        tenant.id,
-        payload.prefix
+         FOR UPDATE"
     )
+    .bind(tenant.id)
+    .bind(&payload.prefix)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::Validation(format!(
@@ -324,19 +325,26 @@ pub async fn create_support_document(
         payload.prefix
     )))?;
 
-    if range.current_counter >= range.to_number {
+    let (range_id, current_counter, to_number) = {
+        use sqlx::Row;
+        (
+            range_row.get::<Uuid, _>("id"),
+            range_row.get::<i32, _>("current_counter"),
+            range_row.get::<i32, _>("to_number"),
+        )
+    };
+
+    if current_counter >= to_number {
         return Err(ApiError::Validation("Rango de numeracion agotado para documento soporte".to_string()));
     }
 
-    let next_number = range.current_counter + 1;
+    let next_number = current_counter + 1;
 
     // Incrementar consecutivo
-    sqlx::query!(
-        "UPDATE numbering_ranges SET current_counter = current_counter + 1 WHERE id = $1",
-        range.id
-    )
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("UPDATE numbering_ranges SET current_counter = current_counter + 1 WHERE id = $1")
+        .bind(range_id)
+        .execute(&mut *tx)
+        .await?;
 
     // Actualizar el payload inyectando el número consecutivo reservado
     let mut updated_payload = payload.clone();

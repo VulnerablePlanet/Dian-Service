@@ -25,6 +25,9 @@ pub enum ApiError {
 
     #[error("Not Found: {0}")]
     NotFound(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 impl IntoResponse for ApiError {
@@ -36,6 +39,7 @@ impl IntoResponse for ApiError {
             ApiError::Domain(e) => (StatusCode::BAD_REQUEST, "DOMAIN_ERROR", e.to_string()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT_ERROR", msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
 
         let body = Json(json!({

@@ -46,7 +46,7 @@ impl<'a> XadesSigner<'a> {
         // Para simplificar, usamos valores genéricos/estándar para Issuer y Serial en este motor de ejemplo,
         // o los extraemos. Dejamos marcadores estables.
         let signed_properties_xml = format!(
-            r#"<xades:SignedProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Id="{}"><xades:SignedSignatureProperties><xades:SigningTime>{}</xades:SigningTime><xades:SigningCertificate><xades:Cert><xades:CertDigest><ds:DigestMethod xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{}</ds:DigestValue></xades:CertDigest><xades:IssuerSerial><ds:X509IssuerName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">C=CO,L=Bogota,O=DIAN,CN=Subca de Facturacion</ds:X509IssuerName><ds:X509SerialNumber xmlns:ds="http://www.w3.org/2000/09/xmldsig#">123456789</ds:X509SerialNumber></xades:IssuerSerial></xades:Cert></xades:SigningCertificate><xades:SignaturePolicyIdentifier><xades:SignaturePolicyId><xades:SigPolicyId><xades:Identifier>https://facturaelectronica.dian.gov.co/politicadefirma/v2/politicadefirmav2.pdf</xades:Identifier><xades:Description>Politica de firma para facturas electronicas de la Republica de Colombia</xades:Description></xades:SigPolicyId><xades:SigPolicyHash><ds:DigestMethod xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue xmlns:ds="http://www.w3.org/2000/09/xmldsig#">dMoQAPcKeQZssgOD5Wgd5CCaaZssgOD5Wgd5CCaaZss=</ds:DigestValue></xades:SigPolicyHash></xades:SignaturePolicyId></xades:SignaturePolicyIdentifier></xades:SignedSignatureProperties></xades:SignedProperties>"#,
+            r##"<xades:SignedProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Id="{}"><xades:SignedSignatureProperties><xades:SigningTime>{}</xades:SigningTime><xades:SigningCertificate><xades:Cert><xades:CertDigest><ds:DigestMethod xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{}</ds:DigestValue></xades:CertDigest><xades:IssuerSerial><ds:X509IssuerName xmlns:ds="http://www.w3.org/2000/09/xmldsig#">C=CO,L=Bogota,O=DIAN,CN=Subca de Facturacion</ds:X509IssuerName><ds:X509SerialNumber xmlns:ds="http://www.w3.org/2000/09/xmldsig#">123456789</ds:X509SerialNumber></xades:IssuerSerial></xades:Cert></xades:SigningCertificate><xades:SignaturePolicyIdentifier><xades:SignaturePolicyId><xades:SigPolicyId><xades:Identifier>https://facturaelectronica.dian.gov.co/politicadefirma/v2/politicadefirmav2.pdf</xades:Identifier><xades:Description>Politica de firma para facturas electronicas de la Republica de Colombia</xades:Description></xades:SigPolicyId><xades:SigPolicyHash><ds:DigestMethod xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue xmlns:ds="http://www.w3.org/2000/09/xmldsig#">dMoQAPcKeQZssgOD5Wgd5CCaaZssgOD5Wgd5CCaaZss=</ds:DigestValue></xades:SigPolicyHash></xades:SignaturePolicyId></xades:SignaturePolicyIdentifier></xades:SignedSignatureProperties></xades:SignedProperties>"##,
             signed_props_id, signing_time, cert_digest_b64
         );
 
@@ -59,7 +59,7 @@ impl<'a> XadesSigner<'a> {
 
         // 3. Construir KeyInfo
         let key_info_xml = format!(
-            r#"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="{}"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"#,
+            r##"<ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="{}"><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"##,
             key_info_id, cert_b64
         );
 
@@ -79,7 +79,7 @@ impl<'a> XadesSigner<'a> {
 
         // 5. Construir SignedInfo
         let signed_info_xml = format!(
-            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference><ds:Reference URI="#{}"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference><ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#{}"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference></ds:SignedInfo>"#,
+            r##"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference><ds:Reference URI="#{}"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference><ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#{}"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>{}</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
             doc_digest_b64, key_info_id, key_info_digest_b64, signed_props_id, signed_properties_digest_b64
         );
 
@@ -97,7 +97,7 @@ impl<'a> XadesSigner<'a> {
 
         // 7. Ensamble final del bloque de firma XML
         let signature_block = format!(
-            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="{}">{}<ds:SignatureValue>{}</ds:SignatureValue>{}<ds:Object><xades:QualifyingProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Target="#{}">{}</xades:QualifyingProperties></ds:Object></ds:Signature>"#,
+            r##"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="{}">{}<ds:SignatureValue>{}</ds:SignatureValue>{}<ds:Object><xades:QualifyingProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Target="#{}">{}</xades:QualifyingProperties></ds:Object></ds:Signature>"##,
             sig_id, signed_info_xml, signature_b64, key_info_xml, sig_id, signed_properties_xml
         );
 

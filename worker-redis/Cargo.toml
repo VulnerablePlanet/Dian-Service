@@ -20,4 +20,5 @@ sqlx = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true }
 rand = "0.8"

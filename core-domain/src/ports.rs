@@ -1,5 +1,5 @@
 use crate::models::{
-    Certificate, DateTime, DianEvent, Document, DocumentType, NumberingRange, Tenant, Webhook,
+    Certificate, DianEvent, Document, DocumentType, NumberingRange, Tenant, Webhook,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

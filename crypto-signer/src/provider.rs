@@ -1,7 +1,7 @@
 use crate::error::CryptoError;
 use crate::vault::VaultClient;
 use async_trait::async_trait;
-use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
+use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey, RsaPrivateKey};
 use rsa::Pkcs1v15Sign;
 use sha2::Sha384;
 

@@ -168,6 +168,7 @@ pub async fn register_document_event(
     )
     .bind(doc_id)
     .bind(tenant.id)
+    .fetch_optional(&pool)
     .await?
     .ok_or_else(|| ApiError::NotFound(format!("Documento {} no encontrado", doc_id)))?;
 
