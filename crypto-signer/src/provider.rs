@@ -20,6 +20,20 @@ pub struct LocalCertificateProvider {
     pub private_key_pem: String,
 }
 
+impl LocalCertificateProvider {
+    /// Construye el proveedor validando de inmediato que la llave y el certificado se
+    /// pueden usar, para fallar al arrancar y no en el primer documento.
+    pub fn from_pem(certificate_pem: String, private_key_pem: String) -> Result<Self, CryptoError> {
+        parse_pem_private_key(&private_key_pem)?;
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, clean_pem(&certificate_pem))
+            .map_err(|e| CryptoError::Provider(format!("Invalid certificate PEM: {}", e)))?;
+        Ok(Self {
+            certificate_pem,
+            private_key_pem,
+        })
+    }
+}
+
 #[async_trait]
 impl CertificateProvider for LocalCertificateProvider {
     async fn get_certificate(&self, _key_ref: &str) -> Result<String, CryptoError> {

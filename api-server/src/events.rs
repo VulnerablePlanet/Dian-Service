@@ -1,16 +1,24 @@
+use crate::config::ApiConfig;
 use crate::error::ApiError;
 use axum::{
     extract::{Path, State},
     Extension, Json, response::IntoResponse,
 };
 use core_domain::models::{DianEvent, Document, DocumentStatus, DocumentType, EventStatus, Tenant};
-use crypto_signer::provider::LocalCertificateProvider;
-use crypto_signer::sign_document;
-use dian_soap_client::client::DianSoapClientImpl;
 use core_domain::ports::DianSoapClient;
+use core_domain::repository::PgDocumentRepository;
+use crypto_signer::signer::SignerConfig;
+use dian_soap_client::client::DianSoapClientImpl;
 use serde_json::json;
 use sqlx::PgPool;
+use std::io::Read;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Tamaño máximo descomprimido del XML de un AttachedDocument (protección contra bombas ZIP).
+const MAX_INBOUND_XML_BYTES: u64 = 10 * 1024 * 1024;
+/// Número máximo de entradas que se inspeccionan dentro del ZIP recibido.
+const MAX_INBOUND_ZIP_ENTRIES: usize = 20;
 
 #[derive(serde::Deserialize)]
 pub struct InboundInvoicePayload {
@@ -29,38 +37,27 @@ pub struct EventRequest {
 pub async fn receive_inbound_invoice(
     State((pool, _)): State<(PgPool, redis::Client)>,
     Extension(tenant): Extension<Tenant>,
+    Extension(config): Extension<Arc<ApiConfig>>,
     Json(payload): Json<InboundInvoicePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // 0. La verificación criptográfica de la firma aún no está implementada: sin ella no se
+    //    puede distinguir una factura legítima de una fabricada.
+    if !config.inbound_allow_unverified_signatures {
+        return Err(ApiError::NotImplemented(
+            "El registro de facturas recibidas está deshabilitado hasta implementar la \
+             verificación criptográfica de la firma del AttachedDocument"
+                .to_string(),
+        ));
+    }
+
     // 1. Decodificar Base64
     let zip_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.zip_content)
         .map_err(|e| ApiError::Validation(format!("Contenido ZIP Base64 invalido: {}", e)))?;
 
-    // 2. Descomprimir ZIP en memoria
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| ApiError::Validation(format!("No se pudo leer el archivo ZIP: {}", e)))?;
+    // 2. Descomprimir ZIP en memoria con límites de tamaño
+    let xml_content = extract_first_xml(&zip_bytes)?;
 
-    if archive.is_empty() {
-        return Err(ApiError::Validation("El archivo ZIP esta vacio".to_string()));
-    }
-
-    let mut xml_content = String::new();
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)
-            .map_err(|e| ApiError::Validation(format!("Error leyendo elemento en ZIP: {}", e)))?;
-        if file.name().ends_with(".xml") {
-            use std::io::Read;
-            file.read_to_string(&mut xml_content)
-                .map_err(|e| ApiError::Validation(format!("Error leyendo XML del ZIP: {}", e)))?;
-            break;
-        }
-    }
-
-    if xml_content.is_empty() {
-        return Err(ApiError::Validation("No se encontro ningun archivo XML en el ZIP".to_string()));
-    }
-
-    // 3. Validar firma digital presente
+    // 3. Validar firma digital presente (solo presencia: NO es una verificación criptográfica)
     if !xml_content.contains("<ds:Signature") && !xml_content.contains("<Signature") {
         return Err(ApiError::Validation("El AttachedDocument XML no esta firmado digitalmente".to_string()));
     }
@@ -100,24 +97,17 @@ pub async fn receive_inbound_invoice(
     }
 
     // Separar prefijo y consecutivo para guardarlo en la DB
-    let mut prefix = String::new();
-    let mut number = 0;
-    if let Some(pos) = parent_document_id.rfind('-') {
-        prefix = parent_document_id[..pos].to_string();
-        number = parent_document_id[pos + 1..].parse::<i32>().unwrap_or(0);
-    } else {
-        let first_digit_idx = parent_document_id.find(|c: char| c.is_ascii_digit());
-        if let Some(idx) = first_digit_idx {
-            prefix = parent_document_id[..idx].to_string();
-            number = parent_document_id[idx..].parse::<i32>().unwrap_or(0);
-        } else {
-            number = parent_document_id.parse::<i32>().unwrap_or(0);
-        }
-    }
+    let (prefix, number) = split_document_id(&parent_document_id).ok_or_else(|| {
+        ApiError::Validation(format!(
+            "El ParentDocumentID '{}' no tiene un consecutivo numerico valido",
+            parent_document_id
+        ))
+    })?;
 
     let doc_id = Uuid::new_v4();
     let doc_payload = json!({
         "inbound": true,
+        "signature_verified": false,
         "parent_document_id": parent_document_id,
         "cufe": cufe,
         "sender_nit": sender_nit,
@@ -126,15 +116,17 @@ pub async fn receive_inbound_invoice(
         "receiver_name": receiver_name
     });
 
-    // 6. Almacenar en PostgreSQL
-    sqlx::query(
-        "INSERT INTO documents (id, tenant_id, document_type, prefix, document_number, cufe_cude, payload, signed_xml, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (tenant_id, document_type, prefix, document_number) DO UPDATE
-         SET signed_xml = EXCLUDED.signed_xml, payload = EXCLUDED.payload, cufe_cude = EXCLUDED.cufe_cude, status = EXCLUDED.status"
+    // 6. Almacenar en PostgreSQL. La clave única incluye dirección y NIT emisor, y nunca se
+    //    sobrescribe un documento existente: un duplicado devuelve 409.
+    let inserted = sqlx::query(
+        "INSERT INTO documents (id, tenant_id, direction, issuer_nit, document_type, prefix, document_number, cufe_cude, payload, signed_xml, status, created_at)
+         VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT ON CONSTRAINT uq_tenant_document DO NOTHING
+         RETURNING id"
     )
     .bind(doc_id)
     .bind(tenant.id)
+    .bind(&sender_nit)
     .bind(DocumentType::Invoice)
     .bind(&prefix)
     .bind(number)
@@ -143,8 +135,15 @@ pub async fn receive_inbound_invoice(
     .bind(&xml_content)
     .bind(DocumentStatus::DianAccepted)
     .bind(chrono::Utc::now())
-    .execute(&pool)
+    .fetch_optional(&pool)
     .await?;
+
+    if inserted.is_none() {
+        return Err(ApiError::Conflict(format!(
+            "La factura {} del emisor {} ya estaba registrada",
+            parent_document_id, sender_nit
+        )));
+    }
 
     Ok(Json(json!({
         "document_id": doc_id,
@@ -159,6 +158,8 @@ pub async fn receive_inbound_invoice(
 pub async fn register_document_event(
     State((pool, _)): State<(PgPool, redis::Client)>,
     Extension(tenant): Extension<Tenant>,
+    Extension(config): Extension<Arc<ApiConfig>>,
+    Extension(signer): Extension<Arc<SignerConfig>>,
     Path(doc_id): Path<Uuid>,
     Json(req): Json<EventRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -180,6 +181,17 @@ pub async fn register_document_event(
     if !is_inbound {
         return Err(ApiError::Validation(
             "Solo se pueden emitir eventos del RADIAN sobre facturas inbound de proveedores".to_string()
+        ));
+    }
+
+    // Un evento RADIAN (p. ej. aceptación expresa) tiene efectos de título valor: no se emite
+    // sobre una factura cuya firma no fue verificada criptográficamente.
+    let signature_verified = document.payload.get("signature_verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !signature_verified {
+        return Err(ApiError::Validation(
+            "No se pueden emitir eventos RADIAN sobre una factura cuya firma no fue verificada".to_string()
         ));
     }
 
@@ -207,8 +219,7 @@ pub async fn register_document_event(
     };
 
     let event_id = format!("EV-{}", Uuid::new_v4());
-    let issue_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let issue_time = chrono::Utc::now().format("%H:%M:%S-05:00").to_string();
+    let (issue_date, issue_time) = core_domain::time::colombia_date_time(chrono::Utc::now());
 
     // Nosotros (adquirente/tenant) somos el SENDER del evento. El proveedor es el RECEIVER del evento.
     // 2. Generar el XML de ApplicationResponse (evento) y calcular el CUDE
@@ -230,13 +241,10 @@ pub async fn register_document_event(
         &req.environment,
     ).map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Internal(e.to_string())))?;
 
-    // 3. Firmar digitalmente con XAdES-EPES
-    let provider = LocalCertificateProvider {
-        certificate_pem: "cert_dummy".to_string(),
-        private_key_pem: "key_dummy".to_string(),
-    };
-
-    let signed_xml = sign_document(&unsigned_xml, &provider, "key_ref")
+    // 3. Firmar digitalmente con XAdES-EPES usando el certificado del tenant
+    let repo = PgDocumentRepository::new(pool.clone());
+    let signed_xml = signer
+        .sign_for_tenant(&repo, tenant.id, &unsigned_xml)
         .await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Crypto(e.to_string())))?;
 
@@ -250,10 +258,11 @@ pub async fn register_document_event(
 
     // 5. Transmitir SOAP SendEventUpdateStatus a la DIAN (fuera de transacciones de DB)
     let is_hab = req.environment == "2";
-    let binary_security_token = std::env::var("DIAN_BINARY_SECURITY_TOKEN")
-        .unwrap_or_else(|_| "token_dummy".to_string());
-    
-    let soap_client = DianSoapClientImpl::new(binary_security_token, None, None);
+    let soap_client = DianSoapClientImpl::new(
+        config.dian_binary_security_token.clone(),
+        config.dian_hab_url.clone(),
+        config.dian_prod_url.clone(),
+    );
     println!("[SOAP RADIAN] Transmitiendo evento {} para la factura {}...", req.event_code, parent_document_id);
     
     let dian_resp = soap_client.send_event_update_status(&zip_bytes, is_hab).await
@@ -299,6 +308,73 @@ pub async fn register_document_event(
     })))
 }
 
+/// Devuelve el primer `.xml` del ZIP, limitando el tamaño descomprimido y el número de
+/// entradas para que un ZIP pequeño no pueda agotar la memoria del proceso.
+fn extract_first_xml(zip_bytes: &[u8]) -> Result<String, ApiError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .map_err(|e| ApiError::Validation(format!("No se pudo leer el archivo ZIP: {}", e)))?;
+
+    if archive.is_empty() {
+        return Err(ApiError::Validation("El archivo ZIP esta vacio".to_string()));
+    }
+    if archive.len() > MAX_INBOUND_ZIP_ENTRIES {
+        return Err(ApiError::Validation(format!(
+            "El ZIP contiene demasiados archivos (maximo {})",
+            MAX_INBOUND_ZIP_ENTRIES
+        )));
+    }
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)
+            .map_err(|e| ApiError::Validation(format!("Error leyendo elemento en ZIP: {}", e)))?;
+        let is_xml = file.name().map(|name| name.ends_with(".xml")).unwrap_or(false);
+        if !is_xml {
+            continue;
+        }
+        // El tamaño declarado puede mentir: además se corta la lectura en el límite.
+        if file.size() > MAX_INBOUND_XML_BYTES {
+            return Err(xml_too_large());
+        }
+        let mut raw = Vec::new();
+        file.take(MAX_INBOUND_XML_BYTES + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| ApiError::Validation(format!("Error leyendo XML del ZIP: {}", e)))?;
+        if raw.len() as u64 > MAX_INBOUND_XML_BYTES {
+            return Err(xml_too_large());
+        }
+        let xml = String::from_utf8(raw)
+            .map_err(|_| ApiError::Validation("El XML del ZIP no es UTF-8 valido".to_string()))?;
+        if xml.trim().is_empty() {
+            break;
+        }
+        return Ok(xml);
+    }
+
+    Err(ApiError::Validation("No se encontro ningun archivo XML en el ZIP".to_string()))
+}
+
+fn xml_too_large() -> ApiError {
+    ApiError::Validation(format!(
+        "El XML del ZIP excede el tamano maximo permitido ({} bytes)",
+        MAX_INBOUND_XML_BYTES
+    ))
+}
+
+/// Separa un identificador como `FEV-1002` o `SETP990001` en prefijo y consecutivo.
+fn split_document_id(document_id: &str) -> Option<(String, i32)> {
+    let (prefix, digits) = match document_id.rfind('-') {
+        Some(pos) => (&document_id[..pos], &document_id[pos + 1..]),
+        None => {
+            let idx = document_id.find(|c: char| c.is_ascii_digit())?;
+            (&document_id[..idx], &document_id[idx..])
+        }
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i32>().ok().map(|n| (prefix.to_string(), n))
+}
+
 /// Extrae de forma robusta y rápida el contenido de una etiqueta XML sin importar su prefijo.
 fn extract_tag_content(xml: &str, tag_name: &str) -> Option<String> {
     let mut cursor = 0;
@@ -333,4 +409,58 @@ fn extract_tag_from_section(xml: &str, section_start_tag: &str, section_end_tag:
     let end_pos = xml[start_pos..].find(section_end_tag)? + start_pos;
     let section = &xml[start_pos..end_pos];
     extract_tag_content(section, tag_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for (name, content) in entries {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(content).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn extracts_first_xml_entry() {
+        let zip = zip_with(&[("readme.txt", b"hola"), ("ad.xml", b"<AttachedDocument/>")]);
+        assert_eq!(extract_first_xml(&zip).unwrap(), "<AttachedDocument/>");
+    }
+
+    #[test]
+    fn rejects_zip_bomb() {
+        let huge = vec![b' '; (MAX_INBOUND_XML_BYTES + 1024) as usize];
+        let zip = zip_with(&[("bomb.xml", &huge)]);
+        assert!(zip.len() < 100 * 1024, "the bomb must be small once compressed");
+        let err = extract_first_xml(&zip).unwrap_err();
+        assert!(err.to_string().contains("excede"));
+    }
+
+    #[test]
+    fn rejects_zip_without_xml_or_with_too_many_entries() {
+        assert!(extract_first_xml(&zip_with(&[("a.txt", b"x")])).is_err());
+        let names: Vec<String> = (0..=MAX_INBOUND_ZIP_ENTRIES).map(|i| format!("f{}.txt", i)).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x" as &[u8])).collect();
+        assert!(extract_first_xml(&zip_with(&entries)).is_err());
+    }
+
+    #[test]
+    fn splits_document_ids() {
+        assert_eq!(split_document_id("FEV-1002"), Some(("FEV".to_string(), 1002)));
+        assert_eq!(split_document_id("SETP990001"), Some(("SETP".to_string(), 990001)));
+        assert_eq!(split_document_id("1234"), Some(("".to_string(), 1234)));
+        assert_eq!(split_document_id("FEV-ABC"), None);
+        assert_eq!(split_document_id("FEV"), None);
+        assert_eq!(split_document_id("FE12A"), None);
+    }
 }

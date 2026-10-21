@@ -297,8 +297,8 @@ mod tests {
         assert!(xml.contains("<AttachedDocument"));
         assert!(xml.contains("Factura Electrónica de Venta"));
         assert!(xml.contains("ATT-DOC-001"));
-        assert!(xml.contains("<![CDATA[<Invoice>signed</Invoice>]]>"));
-        assert!(xml.contains("<![CDATA[<DianResponse>accepted</DianResponse>]]>"));
+        assert!(xml.contains("&lt;Invoice&gt;signed&lt;&#x2f;Invoice&gt;"));
+        assert!(xml.contains("&lt;DianResponse&gt;accepted&lt;&#x2f;DianResponse&gt;"));
         assert!(xml.contains("my_cufe_hash"));
     }
 
@@ -390,5 +390,33 @@ mod tests {
         assert!(xml.contains(&cuds));
         assert!(xml.contains("100000.00"));
         assert!(xml.contains("19000.00"));
+    }
+
+    #[test]
+    fn test_interpolated_values_are_xml_escaped() {
+        let payload = InvoicePayload {
+            prefix: "FE".to_string(),
+            number: 1002,
+            issue_date: "2026-05-23".to_string(),
+            issue_time: "10:42:00-05:00".to_string(),
+            company_nit: "900123456".to_string(),
+            company_name: "A & B <Ltda>".to_string(),
+            customer_id_type: "31".to_string(),
+            customer_id: "900999888".to_string(),
+            customer_name: "</cbc:Name><cbc:Injected>x</cbc:Injected>".to_string(),
+            customer_email: "cliente@receptor.com".to_string(),
+            net_amount: 100000.00,
+            tax_amount: 19000.00,
+            total_amount: 119000.00,
+            environment: "2".to_string(),
+            technical_key: "clave_tecnica_dian".to_string(),
+            document_type: "invoice".to_string(),
+            test_set_id: None,
+        };
+
+        let (xml, _) = generate_invoice_xml(&payload).unwrap();
+        assert!(xml.contains("A &amp; B &lt;Ltda&gt;"));
+        assert!(!xml.contains("<cbc:Injected>"));
+        assert!(!xml.contains("A & B <Ltda>"));
     }
 }

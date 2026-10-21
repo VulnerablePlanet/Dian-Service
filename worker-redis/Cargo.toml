@@ -22,3 +22,6 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 rand = "0.8"
+
+[dev-dependencies]
+core-domain = { path = "../core-domain", features = ["testing"] }

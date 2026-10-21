@@ -20,3 +20,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+core-domain = { path = "../core-domain", features = ["testing"] }

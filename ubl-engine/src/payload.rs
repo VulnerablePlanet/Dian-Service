@@ -76,11 +76,30 @@ impl InvoicePayload {
         }
 
         // 7. Validar tipo de documento
+        // Las notas crédito/débito requieren su propia plantilla UBL, BillingReference y CUDE;
+        // hasta implementarlas se rechazan para no emitirlas como factura de venta.
         match self.document_type.as_str() {
-            "invoice" | "credit_note" | "debit_note" => {}
+            "invoice" => {}
+            "credit_note" | "debit_note" => {
+                return Err(UblError::Validation(
+                    "Las notas crédito y débito aún no están soportadas".to_string(),
+                ));
+            }
             _ => {
                 return Err(UblError::Validation(
-                    "Tipo de documento inválido. Debe ser 'invoice', 'credit_note' o 'debit_note'".to_string(),
+                    "Tipo de documento inválido. Debe ser 'invoice'".to_string(),
+                ));
+            }
+        }
+
+        // 7b. Validar el identificador del set de pruebas (se inserta en el cuerpo SOAP)
+        if let Some(test_set_id) = &self.test_set_id {
+            let valid = !test_set_id.is_empty()
+                && test_set_id.len() <= 64
+                && test_set_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if !valid {
+                return Err(UblError::Validation(
+                    "El test_set_id solo puede contener letras, números y guiones (máximo 64)".to_string(),
                 ));
             }
         }
@@ -139,6 +158,26 @@ mod tests {
     fn test_invalid_time() {
         let mut payload = mock_payload();
         payload.issue_time = "10:42:00".to_string();
+        assert!(payload.validate().is_err());
+    }
+
+    #[test]
+    fn test_credit_and_debit_notes_are_rejected() {
+        for doc_type in ["credit_note", "debit_note"] {
+            let mut payload = mock_payload();
+            payload.document_type = doc_type.to_string();
+            assert!(payload.validate().is_err(), "{} must be rejected", doc_type);
+        }
+    }
+
+    #[test]
+    fn test_test_set_id_format() {
+        let mut payload = mock_payload();
+        payload.test_set_id = Some("8a7b6c5d-1234-4f00-9abc-0123456789ab".to_string());
+        assert!(payload.validate().is_ok());
+        payload.test_set_id = Some("abc</wcf:testSetId><x>".to_string());
+        assert!(payload.validate().is_err());
+        payload.test_set_id = Some(String::new());
         assert!(payload.validate().is_err());
     }
 

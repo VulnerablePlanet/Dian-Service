@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json, response::IntoResponse,
 };
+use core_domain::jobs::DocumentJob;
 use core_domain::models::{Document, DocumentStatus, DocumentType, Tenant};
 use redis::AsyncCommands;
 use serde_json::json;
@@ -28,14 +29,9 @@ pub async fn create_invoice(
         ));
     }
 
-    let doc_type = match payload.document_type.as_str() {
-        "invoice" => DocumentType::Invoice,
-        "credit_note" => DocumentType::CreditNote,
-        "debit_note" => DocumentType::DebitNote,
-        _ => return Err(ApiError::Validation(
-            "Tipo de documento invalido. Debe ser 'invoice', 'credit_note' o 'debit_note'".to_string()
-        )),
-    };
+    // `payload.validate()` solo admite "invoice": las notas crédito/débito aún no tienen
+    // plantilla ni CUDE propios.
+    let doc_type = DocumentType::Invoice;
 
     // 3. Persistir en PostgreSQL usando transaccion corta con bloqueo pesimista
     let doc_id = Uuid::new_v4();
@@ -130,11 +126,9 @@ pub async fn create_invoice(
     let mut redis_conn = redis_client.get_async_connection().await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 
-    let job = json!({
-        "document_id": doc_id,
-        "attempt": 1
-    });
-    let job_str = serde_json::to_string(&job).unwrap();
+    let job_str = DocumentJob::new(doc_id)
+        .to_payload()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let _: () = redis_conn.lpush("dian_jobs", job_str).await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 
@@ -273,11 +267,9 @@ pub async fn create_payroll(
     let mut redis_conn = redis_client.get_async_connection().await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 
-    let job = json!({
-        "document_id": doc_id,
-        "attempt": 1
-    });
-    let job_str = serde_json::to_string(&job).unwrap();
+    let job_str = DocumentJob::new(doc_id)
+        .to_payload()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let _: () = redis_conn.lpush("dian_jobs", job_str).await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 
@@ -388,11 +380,9 @@ pub async fn create_support_document(
     let mut redis_conn = redis_client.get_async_connection().await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 
-    let job = json!({
-        "document_id": doc_id,
-        "attempt": 1
-    });
-    let job_str = serde_json::to_string(&job).unwrap();
+    let job_str = DocumentJob::new(doc_id)
+        .to_payload()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let _: () = redis_conn.lpush("dian_jobs", job_str).await
         .map_err(|e| ApiError::Domain(core_domain::ports::DomainError::Queue(e.to_string())))?;
 

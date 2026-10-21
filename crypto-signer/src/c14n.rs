@@ -2,14 +2,15 @@ use crate::error::CryptoError;
 use std::io::Cursor;
 use xml_canonicalization::Canonicalizer;
 
-/// Aplica el algoritmo XML Canonicalization (C14N) exclusivo (omitiendo comentarios) sobre el XML de entrada.
+/// Aplica Canonical XML (C14N inclusivo, sin comentarios) sobre el XML de entrada.
 pub fn canonicalize_xml(xml_content: &str) -> Result<String, CryptoError> {
     let mut result = Vec::new();
     
-    // canonicalize(true) indica Exclusive XML Canonicalization (W3C standard)
+    // El argumento de `canonicalize` es `retain_comments`: con `false` se descartan los
+    // comentarios, de modo que el marcador de firma no entra en el digest.
     Canonicalizer::read_from_str(xml_content)
         .write_to_writer(Cursor::new(&mut result))
-        .canonicalize(true)
+        .canonicalize(false)
         .map_err(|e| CryptoError::C14n(format!("Failed to canonicalize: {:?}", e)))?;
 
     String::from_utf8(result)

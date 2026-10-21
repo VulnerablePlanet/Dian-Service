@@ -58,7 +58,7 @@
         <cac:ExternalReference>
             <cbc:MimeCode>text/xml</cbc:MimeCode>
             <cbc:EncodingCode>UTF-8</cbc:EncodingCode>
-            <cbc:Description><![CDATA[{{ SignedInvoiceXML }}]]></cbc:Description>
+            <cbc:Description>{{ SignedInvoiceXML }}</cbc:Description>
         </cac:ExternalReference>
     </cac:Attachment>
     
@@ -73,7 +73,7 @@
                 <cac:ExternalReference>
                     <cbc:MimeCode>text/xml</cbc:MimeCode>
                     <cbc:EncodingCode>UTF-8</cbc:EncodingCode>
-                    <cbc:Description><![CDATA[{{ DianResponseXML }}]]></cbc:Description>
+                    <cbc:Description>{{ DianResponseXML }}</cbc:Description>
                 </cac:ExternalReference>
             </cac:Attachment>
         </cac:DocumentReference>

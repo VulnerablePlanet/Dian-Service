@@ -1,14 +1,17 @@
 use api_server::handlers::{create_invoice, get_document, create_payroll, create_support_document, health_check};
 use api_server::events::{receive_inbound_invoice, register_document_event};
+use api_server::config::{required_env, ApiConfig};
 use api_server::middleware::auth_middleware;
 use api_server::telemetry::init_telemetry;
 use axum::{
     middleware::from_fn_with_state,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
+use crypto_signer::signer::SignerConfig;
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
 #[tokio::main]
@@ -16,10 +19,17 @@ async fn main() {
     // 1. Inicializar telemetría (Subscriber de tracing)
     init_telemetry();
 
-    // 2. Conectar a PostgreSQL
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/dian".to_string());
-    
+    // 2. Configuración obligatoria: sin valores por defecto para conexiones ni secretos
+    let db_url = required_env("DATABASE_URL").unwrap_or_else(|e| exit_with(&e));
+    let redis_url = required_env("REDIS_URL").unwrap_or_else(|e| exit_with(&e));
+    let config = Arc::new(ApiConfig::from_env().unwrap_or_else(|e| exit_with(&e)));
+    let signer = Arc::new(SignerConfig::from_env().unwrap_or_else(|e| exit_with(&e.to_string())));
+    tracing::info!(signing_mode = ?signer.mode(), "Firma configurada");
+    if config.inbound_allow_unverified_signatures {
+        tracing::warn!("INBOUND_ALLOW_UNVERIFIED_SIGNATURES=true: facturas recibidas sin verificacion criptografica");
+    }
+
+    // Conectar a PostgreSQL
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&db_url)
@@ -27,9 +37,6 @@ async fn main() {
         .expect("Failed to connect to PostgreSQL");
 
     // 3. Conectar a Redis
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    
     let redis_client = redis::Client::open(redis_url)
         .expect("Failed to open Redis client connection");
 
@@ -49,6 +56,8 @@ async fn main() {
         .route("/payroll", post(create_payroll))
         .route("/support-documents", post(create_support_document))
         .layer(from_fn_with_state(pool, auth_middleware))
+        .layer(Extension(config))
+        .layer(Extension(signer))
         .with_state(shared_state)
         .layer(TraceLayer::new_for_http());
 
@@ -69,4 +78,9 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Axum server run failed");
+}
+
+fn exit_with(message: &str) -> ! {
+    eprintln!("Configuracion invalida: {}", message);
+    std::process::exit(1);
 }

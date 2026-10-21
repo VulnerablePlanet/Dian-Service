@@ -1,6 +1,6 @@
 use crate::error::SoapError;
 use std::io::{Cursor, Write};
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 /// Comprime un XML firmado en formato ZIP en memoria.
@@ -21,7 +21,7 @@ pub fn compress_xml_to_zip(
         let cursor = Cursor::new(&mut buf);
         let mut zip = ZipWriter::new(cursor);
 
-        let options = FileOptions::default()
+        let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
         zip.start_file(&xml_filename, options)
@@ -59,7 +59,7 @@ mod tests {
         assert_eq!(archive.len(), 1);
 
         let mut file = archive.by_index(0).unwrap();
-        assert!(file.name().ends_with(".xml"));
+        assert!(file.name().unwrap().ends_with(".xml"));
 
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();

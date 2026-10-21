@@ -1,12 +1,19 @@
 use crate::error::WorkerError;
+use async_trait::async_trait;
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Job {
-    pub document_id: Uuid,
-    pub attempt: u32,
+/// El contrato del mensaje se comparte con `api-server` para que el ACK (que elimina la
+/// cadena serializada exacta) encuentre siempre el trabajo.
+pub use core_domain::jobs::DocumentJob as Job;
+
+#[async_trait]
+pub trait JobQueue: Send + Sync {
+    /// Encola un trabajo en la cola principal.
+    async fn enqueue(&self, job: &Job) -> Result<(), WorkerError>;
+    /// Confirma la finalización de un trabajo eliminándolo de la cola de procesamiento.
+    async fn ack(&self, job: &Job) -> Result<(), WorkerError>;
+    /// Elimina el trabajo de procesamiento y opcionalmente lo re-encola.
+    async fn nack(&self, job: &Job, requeue: bool) -> Result<(), WorkerError>;
 }
 
 pub struct RedisQueue {
@@ -28,14 +35,6 @@ impl RedisQueue {
         })
     }
 
-    /// Encola un trabajo en la cola principal.
-    pub async fn enqueue(&self, job: &Job) -> Result<(), WorkerError> {
-        let mut conn = self.client.get_async_connection().await?;
-        let payload = serde_json::to_string(job)?;
-        let _: () = conn.lpush(&self.queue_name, payload).await?;
-        Ok(())
-    }
-
     /// Extrae un trabajo de forma confiable (RPOPLPUSH bloqueante) moviéndolo a la cola de procesamiento.
     /// Retorna `None` si la cola está vacía tras expiración del timeout de bloqueo.
     pub async fn dequeue_blocking(&self, timeout_sec: f64) -> Result<Option<Job>, WorkerError> {
@@ -50,26 +49,29 @@ impl RedisQueue {
             .await?;
 
         match result {
-            Some(payload) => {
-                let job: Job = serde_json::from_str(&payload)?;
-                Ok(Some(job))
-            }
+            Some(payload) => Ok(Some(Job::from_payload(&payload)?)),
             None => Ok(None),
         }
     }
+}
 
-    /// Confirma la finalización exitosa de un trabajo (ACK). Lo elimina de la cola de procesamiento.
-    pub async fn ack(&self, job: &Job) -> Result<(), WorkerError> {
+#[async_trait]
+impl JobQueue for RedisQueue {
+    async fn enqueue(&self, job: &Job) -> Result<(), WorkerError> {
         let mut conn = self.client.get_async_connection().await?;
-        let payload = serde_json::to_string(job)?;
-        let _: () = conn.lrem(&self.processing_queue_name, 1, payload).await?;
+        let _: () = conn.lpush(&self.queue_name, job.to_payload()?).await?;
         Ok(())
     }
 
-    /// Reporta fallo de procesamiento (NACK). Lo elimina de procesamiento y opcionalmente lo re-encola en la cola principal.
-    pub async fn nack(&self, job: &Job, requeue: bool) -> Result<(), WorkerError> {
+    async fn ack(&self, job: &Job) -> Result<(), WorkerError> {
         let mut conn = self.client.get_async_connection().await?;
-        let payload = serde_json::to_string(job)?;
+        let _: () = conn.lrem(&self.processing_queue_name, 1, job.to_payload()?).await?;
+        Ok(())
+    }
+
+    async fn nack(&self, job: &Job, requeue: bool) -> Result<(), WorkerError> {
+        let mut conn = self.client.get_async_connection().await?;
+        let payload = job.to_payload()?;
         let _: () = conn.lrem(&self.processing_queue_name, 1, &payload).await?;
         
         if requeue {

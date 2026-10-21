@@ -33,6 +33,9 @@ pub enum DocumentStatus {
     DianRejected,
     ContingencyPending,
     ContingencySent,
+    /// Fallo local antes de transmitir (firma, generación XML, tipo no soportado).
+    /// El motivo queda registrado en `dian_events`.
+    ProcessingFailed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]

@@ -3,7 +3,11 @@ use core_domain::ports::{DianResponse, DianSoapClient, DomainError};
 use reqwest::Client;
 use std::io::Cursor;
 use crate::error::SoapError;
-use crate::soap::build_soap_envelope;
+use crate::soap::{build_soap_envelope, xml_escape};
+use std::time::Duration;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct DianSoapClientImpl {
     client: Client,
@@ -18,7 +22,11 @@ impl DianSoapClientImpl {
         hab_url: Option<String>,
         prod_url: Option<String>,
     ) -> Self {
+        // Sin timeout, una DIAN que acepta la conexión y no responde retiene indefinidamente
+        // el permiso de concurrencia del worker.
         let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("Failed to initialize HTTP client for SOAP");
 
@@ -55,7 +63,9 @@ impl DianSoapClientImpl {
             .by_index(0)
             .map_err(|e| SoapError::Zip(format!("Failed to get ZIP file element: {}", e)))?;
         
-        let xml_name = file.name();
+        let xml_name = file
+            .name()
+            .map_err(|e| SoapError::Zip(format!("Invalid ZIP entry name: {}", e)))?;
         let zip_name = xml_name.replace(".xml", ".zip");
         Ok(zip_name)
     }
@@ -77,7 +87,7 @@ impl DianSoapClient for DianSoapClientImpl {
         let action = "http://wcf.dian.colombia/IWcfDianCustomerServices/SendBillSync";
         let body_content = format!(
             r#"<wcf:SendBillSync><wcf:fileName>{}</wcf:fileName><wcf:contentData>{}</wcf:contentData></wcf:SendBillSync>"#,
-            zip_filename, zip_b64
+            xml_escape(&zip_filename), zip_b64
         );
 
         let soap_envelope = build_soap_envelope(action, to_url, &self.binary_security_token, &body_content);
@@ -132,7 +142,7 @@ impl DianSoapClient for DianSoapClientImpl {
         let action = "http://wcf.dian.colombia/IWcfDianCustomerServices/SendBillAsync";
         let body_content = format!(
             r#"<wcf:SendBillAsync><wcf:fileName>{}</wcf:fileName><wcf:contentData>{}</wcf:contentData></wcf:SendBillAsync>"#,
-            zip_filename, zip_b64
+            xml_escape(&zip_filename), zip_b64
         );
 
         let soap_envelope = build_soap_envelope(action, to_url, &self.binary_security_token, &body_content);
@@ -167,7 +177,7 @@ impl DianSoapClient for DianSoapClientImpl {
         let action = "http://wcf.dian.colombia/IWcfDianCustomerServices/SendTestSetAsync";
         let body_content = format!(
             r#"<wcf:SendTestSetAsync><wcf:fileName>{}</wcf:fileName><wcf:contentData>{}</wcf:contentData><wcf:testSetId>{}</wcf:testSetId></wcf:SendTestSetAsync>"#,
-            zip_filename, zip_b64, test_set_id
+            xml_escape(&zip_filename), zip_b64, xml_escape(test_set_id)
         );
 
         let soap_envelope = build_soap_envelope(action, to_url, &self.binary_security_token, &body_content);
@@ -198,7 +208,7 @@ impl DianSoapClient for DianSoapClientImpl {
         let action = "http://wcf.dian.colombia/IWcfDianCustomerServices/GetStatus";
         let body_content = format!(
             r#"<wcf:GetStatus><wcf:trackId>{}</wcf:trackId></wcf:GetStatus>"#,
-            track_id
+            xml_escape(track_id)
         );
 
         let soap_envelope = build_soap_envelope(action, to_url, &self.binary_security_token, &body_content);
@@ -237,7 +247,7 @@ impl DianSoapClient for DianSoapClientImpl {
         let action = "http://wcf.dian.colombia/IWcfDianCustomerServices/GetStatusZip";
         let body_content = format!(
             r#"<wcf:GetStatusZip><wcf:trackId>{}</wcf:trackId></wcf:GetStatusZip>"#,
-            track_id
+            xml_escape(track_id)
         );
 
         let soap_envelope = build_soap_envelope(action, to_url, &self.binary_security_token, &body_content);

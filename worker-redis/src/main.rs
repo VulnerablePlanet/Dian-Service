@@ -7,10 +7,9 @@ use backoff::calculate_backoff_with_jitter;
 use circuit_breaker::{CircuitBreaker, State as CbState};
 use core_domain::models::{DianEvent, Document, DocumentStatus, DocumentType, EventStatus};
 use core_domain::ports::{DianResponse, DianSoapClient, DocumentRepository, DomainError};
-use crypto_signer::provider::LocalCertificateProvider;
-use crypto_signer::sign_document;
+use crypto_signer::signer::SignerConfig;
 use error::WorkerError;
-use queue::{Job, RedisQueue};
+use queue::{Job, JobQueue, RedisQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use ubl_engine::{generate_invoice_xml, generate_payroll_xml, generate_support_document_xml};
@@ -24,7 +23,8 @@ use tokio::sync::Semaphore;
 pub struct DocumentProcessor {
     repo: Arc<dyn DocumentRepository>,
     soap_client: Arc<dyn DianSoapClient>,
-    queue: Arc<RedisQueue>,
+    queue: Arc<dyn JobQueue>,
+    signer: Arc<SignerConfig>,
     cb: Arc<CircuitBreaker>,
     max_attempts: u32,
 }
@@ -33,7 +33,8 @@ impl DocumentProcessor {
     pub fn new(
         repo: Arc<dyn DocumentRepository>,
         soap_client: Arc<dyn DianSoapClient>,
-        queue: Arc<RedisQueue>,
+        queue: Arc<dyn JobQueue>,
+        signer: Arc<SignerConfig>,
         cb: Arc<CircuitBreaker>,
         max_attempts: u32,
     ) -> Self {
@@ -41,6 +42,7 @@ impl DocumentProcessor {
             repo,
             soap_client,
             queue,
+            signer,
             cb,
             max_attempts,
         }
@@ -145,10 +147,7 @@ impl DocumentProcessor {
                             self.queue.nack(&job, false).await?;
                             let sleep_dur = calculate_backoff_with_jitter(job.attempt);
                             let queue_clone = self.queue.clone();
-                            let retry_job = Job {
-                                document_id: job.document_id,
-                                attempt: job.attempt + 1,
-                            };
+                            let retry_job = job.retry();
                             tokio::spawn(async move {
                                 tokio::time::sleep(sleep_dur).await;
                                 let _ = queue_clone.enqueue(&retry_job).await;
@@ -161,10 +160,7 @@ impl DocumentProcessor {
                         self.queue.nack(&job, false).await?;
                         let sleep_dur = calculate_backoff_with_jitter(job.attempt);
                         let queue_clone = self.queue.clone();
-                        let retry_job = Job {
-                            document_id: job.document_id,
-                            attempt: job.attempt + 1,
-                        };
+                        let retry_job = job.retry();
                         tokio::spawn(async move {
                             tokio::time::sleep(sleep_dur).await;
                             let _ = queue_clone.enqueue(&retry_job).await;
@@ -179,55 +175,25 @@ impl DocumentProcessor {
         }
 
         // 3. Generar XML UBL 2.1 base y extraer metadatos según el tipo de documento
-        let (unsigned_xml, cufe_cude, company_nit, prefix, number, is_hab, test_set_id) = match document.document_type {
-            DocumentType::Invoice => {
-                let payload: InvoicePayload = serde_json::from_value(document.payload.clone())
-                    .map_err(|e| WorkerError::Internal(format!("Invalid invoice payload JSON: {}", e)))?;
-                let (xml, cufe) = ubl_engine::generate_invoice_xml(&payload)
-                    .map_err(|e| WorkerError::Internal(format!("Invoice generation failed: {}", e)))?;
-                let is_hab = payload.environment == "2";
-                (xml, cufe, payload.company_nit.clone(), payload.prefix.clone(), payload.number, is_hab, payload.test_set_id.clone())
-            }
-            DocumentType::Payroll => {
-                let payload: ubl_engine::payload::PayrollPayload = serde_json::from_value(document.payload.clone())
-                    .map_err(|e| WorkerError::Internal(format!("Invalid payroll payload JSON: {}", e)))?;
-                let (xml, cune) = ubl_engine::generate_payroll_xml(&payload)
-                    .map_err(|e| WorkerError::Internal(format!("Payroll generation failed: {}", e)))?;
-                let is_hab = payload.environment == "2";
-                (xml, cune, payload.employer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None)
-            }
-            DocumentType::SupportDocument => {
-                let payload: ubl_engine::payload::SupportDocumentPayload = serde_json::from_value(document.payload.clone())
-                    .map_err(|e| WorkerError::Internal(format!("Invalid support document payload JSON: {}", e)))?;
-                let (xml, cuds) = ubl_engine::generate_support_document_xml(&payload)
-                    .map_err(|e| WorkerError::Internal(format!("Support document generation failed: {}", e)))?;
-                let is_hab = payload.environment == "2";
-                (xml, cuds, payload.buyer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None)
-            }
-            DocumentType::CreditNote | DocumentType::DebitNote => {
-                self.queue.ack(&job).await?;
-                return Err(WorkerError::Internal(format!(
-                    "Document type {:?} is not supported yet",
-                    document.document_type
-                )));
-            }
+        let (unsigned_xml, cufe_cude, company_nit, prefix, number, is_hab, test_set_id) = match generate_document_xml(&document) {
+            Ok(generated) => generated,
+            Err(reason) => return self.fail_document(&job, &mut document, reason).await,
         };
 
         // Guardar CUFE/CUDE y XML original
         document.cufe_cude = cufe_cude;
         document.original_xml = Some(unsigned_xml.clone());
 
-        // 4. Firmar el XML (XAdES-EPES)
-        let provider = LocalCertificateProvider {
-            certificate_pem: "cert_dummy".to_string(),
-            private_key_pem: "key_dummy".to_string(),
-        };
-        
-        let signed_xml = match sign_document(&unsigned_xml, &provider, "key_ref").await {
+        // 4. Firmar el XML (XAdES-EPES) con el certificado del tenant
+        let signed_xml = match self
+            .signer
+            .sign_for_tenant(self.repo.as_ref(), document.tenant_id, &unsigned_xml)
+            .await
+        {
             Ok(xml) => xml,
             Err(e) => {
-                self.queue.ack(&job).await?;
-                return Err(WorkerError::Internal(format!("Cryptographic signature failed: {}", e)));
+                let reason = format!("Cryptographic signature failed: {}", e);
+                return self.fail_document(&job, &mut document, reason).await;
             }
         };
         document.signed_xml = Some(signed_xml.clone());
@@ -243,8 +209,8 @@ impl DocumentProcessor {
         ) {
             Ok(res) => res,
             Err(e) => {
-                self.queue.ack(&job).await?;
-                return Err(WorkerError::Internal(format!("ZIP compression failed: {}", e)));
+                let reason = format!("ZIP compression failed: {}", e);
+                return self.fail_document(&job, &mut document, reason).await;
             }
         };
 
@@ -276,10 +242,7 @@ impl DocumentProcessor {
                     self.queue.ack(&job).await?;
                     
                     // Encolar nuevo job para iniciar polling
-                    let poll_job = Job {
-                        document_id: document.id,
-                        attempt: 1,
-                    };
+                    let poll_job = Job::new(document.id);
                     self.queue.enqueue(&poll_job).await?;
                     
                     println!("[Sent] Documento {} enviado asincronamente. ZipKey: {}", document.id, zip_key);
@@ -310,10 +273,7 @@ impl DocumentProcessor {
                         self.queue.nack(&job, false).await?;
                         let sleep_dur = calculate_backoff_with_jitter(job.attempt);
                         let queue_clone = self.queue.clone();
-                        let retry_job = Job {
-                            document_id: job.document_id,
-                            attempt: job.attempt + 1,
-                        };
+                        let retry_job = job.retry();
                         tokio::spawn(async move {
                             tokio::time::sleep(sleep_dur).await;
                             let _ = queue_clone.enqueue(&retry_job).await;
@@ -400,10 +360,7 @@ impl DocumentProcessor {
                     self.queue.nack(&job, false).await?;
                     
                     let queue_clone = self.queue.clone();
-                    let retry_job = Job {
-                        document_id: job.document_id,
-                        attempt: job.attempt + 1,
-                    };
+                    let retry_job = job.retry();
                     tokio::spawn(async move {
                         tokio::time::sleep(sleep_dur).await;
                         let _ = queue_clone.enqueue(&retry_job).await;
@@ -413,6 +370,33 @@ impl DocumentProcessor {
                 Ok(())
             }
         }
+    }
+
+    /// Marca el documento como `ProcessingFailed`, deja el motivo en `dian_events` y
+    /// confirma el trabajo: un fallo local no se puede resolver reintentando.
+    async fn fail_document(
+        &self,
+        job: &Job,
+        document: &mut Document,
+        reason: String,
+    ) -> Result<(), WorkerError> {
+        eprintln!("[Processing Failed] Documento {}: {}", document.id, reason);
+        document.status = DocumentStatus::ProcessingFailed;
+        self.repo.save_document(document).await?;
+        self.repo
+            .save_dian_event(&DianEvent {
+                id: Uuid::new_v4(),
+                document_id: document.id,
+                event_status: EventStatus::Error,
+                dian_response_code: Some("PROCESSING_FAILED".to_string()),
+                dian_response_message: Some(reason.clone()),
+                soap_trace_id: None,
+                xml_response: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await?;
+        self.queue.ack(job).await?;
+        Err(WorkerError::Internal(reason))
     }
 
     /// Genera, firma criptográficamente y empaqueta en ZIP el AttachedDocument (contenedor electrónico)
@@ -425,8 +409,7 @@ impl DocumentProcessor {
         println!("[AttachedDocument] Generando contenedor para {}...", document.id);
         
         let unique_id = format!("ATT-{}", Uuid::new_v4());
-        let issue_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let issue_time = chrono::Utc::now().format("%H:%M:%S-05:00").to_string();
+        let (issue_date, issue_time) = core_domain::time::colombia_date_time(chrono::Utc::now());
         
         let signed_invoice_xml = document.signed_xml.as_ref()
             .ok_or_else(|| WorkerError::Internal("Document does not have signed_xml".to_string()))?;
@@ -443,12 +426,10 @@ impl DocumentProcessor {
         ).map_err(|e| WorkerError::Internal(format!("Failed to generate AttachedDocument XML: {}", e)))?;
 
         // 2. Firmar el AttachedDocument
-        let provider = LocalCertificateProvider {
-            certificate_pem: "cert_dummy".to_string(),
-            private_key_pem: "key_dummy".to_string(),
-        };
-        
-        let signed_att_doc_xml = sign_document(&att_doc_xml, &provider, "key_ref").await
+        let signed_att_doc_xml = self
+            .signer
+            .sign_for_tenant(self.repo.as_ref(), document.tenant_id, &att_doc_xml)
+            .await
             .map_err(|e| WorkerError::Internal(format!("Failed to sign AttachedDocument: {}", e)))?;
 
         // 3. Comprimir a ZIP en memoria
@@ -471,14 +452,66 @@ impl DocumentProcessor {
     }
 }
 
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(format!("Missing required environment variable {}", name).into()),
+    }
+}
+
+type GeneratedDocument = (String, String, String, String, i32, bool, Option<String>);
+
+/// Genera el XML UBL y el CUFE/CUDE/CUNE/CUDS del documento según su tipo.
+fn generate_document_xml(document: &Document) -> Result<GeneratedDocument, String> {
+    match document.document_type {
+        DocumentType::Invoice => {
+            let payload: InvoicePayload = serde_json::from_value(document.payload.clone())
+                .map_err(|e| format!("Invalid invoice payload JSON: {}", e))?;
+            let (xml, cufe) = ubl_engine::generate_invoice_xml(&payload)
+                .map_err(|e| format!("Invoice generation failed: {}", e))?;
+            let is_hab = payload.environment == "2";
+            Ok((xml, cufe, payload.company_nit.clone(), payload.prefix.clone(), payload.number, is_hab, payload.test_set_id.clone()))
+        }
+        DocumentType::Payroll => {
+            let payload: ubl_engine::payload::PayrollPayload = serde_json::from_value(document.payload.clone())
+                .map_err(|e| format!("Invalid payroll payload JSON: {}", e))?;
+            let (xml, cune) = ubl_engine::generate_payroll_xml(&payload)
+                .map_err(|e| format!("Payroll generation failed: {}", e))?;
+            let is_hab = payload.environment == "2";
+            Ok((xml, cune, payload.employer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None))
+        }
+        DocumentType::SupportDocument => {
+            let payload: ubl_engine::payload::SupportDocumentPayload = serde_json::from_value(document.payload.clone())
+                .map_err(|e| format!("Invalid support document payload JSON: {}", e))?;
+            let (xml, cuds) = ubl_engine::generate_support_document_xml(&payload)
+                .map_err(|e| format!("Support document generation failed: {}", e))?;
+            let is_hab = payload.environment == "2";
+            Ok((xml, cuds, payload.buyer_nit.clone(), payload.prefix.clone(), payload.number, is_hab, None))
+        }
+        DocumentType::CreditNote | DocumentType::DebitNote => Err(format!(
+            "Document type {:?} is not supported yet",
+            document.document_type
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Iniciando worker-redis...");
 
+    // 0. Configuración obligatoria: sin valores por defecto para conexiones ni secretos
+    let db_url = required_env("DATABASE_URL")?;
+    let redis_url = required_env("REDIS_URL")?;
+    let binary_security_token = required_env("DIAN_BINARY_SECURITY_TOKEN")?;
+    let signer = Arc::new(SignerConfig::from_env()?);
+    println!("Firma configurada en modo {:?}", signer.mode());
+
     // 1. Conectar a PostgreSQL
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/dian".to_string());
-    
+
     let db_pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&db_url)
@@ -486,9 +519,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to connect to PostgreSQL in worker-redis");
 
     // 2. Conectar a Redis
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    
     let redis_client = redis::Client::open(redis_url.clone())
         .expect("Failed to open Redis client in worker-redis");
 
@@ -497,10 +527,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Inicializar componentes
     let repo = Arc::new(PgDocumentRepository::new(db_pool.clone()));
     
-    let binary_security_token = std::env::var("DIAN_BINARY_SECURITY_TOKEN")
-        .unwrap_or_else(|_| "token_dummy".to_string());
-    
-    let soap_client = Arc::new(DianSoapClientImpl::new(binary_security_token, None, None));
+    let soap_client = Arc::new(DianSoapClientImpl::new(
+        binary_security_token,
+        optional_env("DIAN_HAB_URL"),
+        optional_env("DIAN_PROD_URL"),
+    ));
     
     let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
     
@@ -509,6 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repo,
         soap_client,
         queue.clone(),
+        signer,
         cb,
         max_attempts,
     ));
@@ -588,52 +620,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use core_domain::models::{Certificate, NumberingRange, Tenant, Webhook};
+    use core_domain::testing::InMemoryRepository;
+    use crypto_signer::provider::LocalCertificateProvider;
+    use crypto_signer::signer::KeyMode;
     use std::sync::Mutex as StdMutex;
 
-    // Mock Database Repository
-    struct MockRepository {
-        document: Arc<StdMutex<Document>>,
-        saved: Arc<StdMutex<bool>>,
+    const TEST_KEY_PEM: &str = include_str!("../../crypto-signer/tests/fixtures/test_key.pem");
+    const TEST_CERT_PEM: &str = include_str!("../../crypto-signer/tests/fixtures/test_cert.pem");
+
+    /// Cola en memoria que registra las operaciones para poder afirmarlas.
+    #[derive(Default)]
+    struct RecordingQueue {
+        acked: StdMutex<Vec<Job>>,
+        nacked: StdMutex<Vec<Job>>,
+        enqueued: StdMutex<Vec<Job>>,
     }
 
     #[async_trait]
-    impl DocumentRepository for MockRepository {
-        async fn save_tenant(&self, _tenant: &Tenant) -> Result<(), DomainError> { Ok(()) }
-        async fn find_tenant_by_id(&self, _id: Uuid) -> Result<Option<Tenant>, DomainError> { Ok(None) }
-        async fn save_certificate(&self, _cert: &Certificate) -> Result<(), DomainError> { Ok(()) }
-        async fn find_certificate_by_id(&self, _id: Uuid) -> Result<Option<Certificate>, DomainError> { Ok(None) }
-        async fn find_active_certificate_by_tenant(&self, _tenant_id: Uuid) -> Result<Option<Certificate>, DomainError> { Ok(None) }
-        async fn save_numbering_range(&self, _range: &NumberingRange) -> Result<(), DomainError> { Ok(()) }
-        async fn find_numbering_range_by_id(&self, _id: Uuid) -> Result<Option<NumberingRange>, DomainError> { Ok(None) }
-        async fn increment_numbering_range(&self, _id: Uuid) -> Result<i32, DomainError> { Ok(1) }
-
-        async fn save_document(&self, doc: &Document) -> Result<(), DomainError> {
-            let mut d = self.document.lock().unwrap();
-            *d = doc.clone();
-            let mut s = self.saved.lock().unwrap();
-            *s = true;
+    impl JobQueue for RecordingQueue {
+        async fn enqueue(&self, job: &Job) -> Result<(), WorkerError> {
+            self.enqueued.lock().unwrap().push(job.clone());
             Ok(())
         }
-
-        async fn find_document_by_id(&self, _id: Uuid) -> Result<Option<Document>, DomainError> {
-            let d = self.document.lock().unwrap();
-            Ok(Some(d.clone()))
+        async fn ack(&self, job: &Job) -> Result<(), WorkerError> {
+            self.acked.lock().unwrap().push(job.clone());
+            Ok(())
         }
-
-        async fn find_document_by_number(&self, _tenant_id: Uuid, _type: DocumentType, _prefix: &str, _number: i32) -> Result<Option<Document>, DomainError> {
-            Ok(None)
+        async fn nack(&self, job: &Job, _requeue: bool) -> Result<(), WorkerError> {
+            self.nacked.lock().unwrap().push(job.clone());
+            Ok(())
         }
-
-        async fn save_dian_event(&self, _event: &DianEvent) -> Result<(), DomainError> { Ok(()) }
-        async fn find_dian_events_by_document_id(&self, _doc_id: Uuid) -> Result<Vec<DianEvent>, DomainError> { Ok(vec![]) }
-        async fn save_webhook(&self, _webhook: &Webhook) -> Result<(), DomainError> { Ok(()) }
-        async fn find_webhooks_by_tenant_id(&self, _tenant_id: Uuid) -> Result<Vec<Webhook>, DomainError> { Ok(vec![]) }
     }
 
-    // Mock SOAP client
     struct MockSoapClient {
         should_fail: bool,
+    }
+
+    fn accepted() -> DianResponse {
+        DianResponse {
+            status_code: "00".to_string(),
+            message: "Aceptado".to_string(),
+            xml_response: Some("<resp/>".to_string()),
+            soap_trace_id: Some("trace_abc".to_string()),
+        }
     }
 
     #[async_trait]
@@ -642,73 +671,41 @@ mod tests {
             if self.should_fail {
                 return Err(DomainError::Soap("DIAN is down".to_string()));
             }
-            Ok(DianResponse {
-                status_code: "00".to_string(),
-                message: "Aceptado".to_string(),
-                xml_response: Some("<resp/>".to_string()),
-                soap_trace_id: Some("trace_abc".to_string()),
-            })
+            Ok(accepted())
         }
-        async fn send_bill_async(&self, _zip: &[u8], _is_hab: bool) -> Result<String, DomainError> { Ok("key".to_string()) }
+        async fn send_bill_async(&self, _zip: &[u8], _is_hab: bool) -> Result<String, DomainError> {
+            Ok("key".to_string())
+        }
         async fn send_test_set_async(&self, _zip: &[u8], _test_set_id: &str, _is_hab: bool) -> Result<String, DomainError> {
             Ok("test_set_zip_key".to_string())
         }
         async fn get_status(&self, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
-            Ok(DianResponse {
-                status_code: "00".to_string(),
-                message: "Aceptado".to_string(),
-                xml_response: None,
-                soap_trace_id: None,
-            })
+            Ok(accepted())
         }
         async fn get_status_zip(&self, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
-            Ok(DianResponse {
-                status_code: "00".to_string(),
-                message: "Aceptado".to_string(),
-                xml_response: Some("<resp/>".to_string()),
-                soap_trace_id: Some(_track_id.to_string()),
-            })
+            Ok(accepted())
         }
         async fn send_event_update_status(&self, _zip: &[u8], _is_hab: bool) -> Result<DianResponse, DomainError> {
-            if self.should_fail {
-                return Err(DomainError::Soap("DIAN is down".to_string()));
-            }
-            Ok(DianResponse {
-                status_code: "00".to_string(),
-                message: "Aceptado".to_string(),
-                xml_response: Some("<resp/>".to_string()),
-                soap_trace_id: Some("event_trace_abc".to_string()),
-            })
+            Ok(accepted())
         }
     }
 
-    #[tokio::test]
-    async fn test_process_job_success() {
-        let doc_id = Uuid::new_v4();
-        let payload = serde_json::json!({
-            "prefix": "FE",
-            "number": 1002,
-            "issue_date": "2026-05-23",
-            "issue_time": "10:42:00-05:00",
-            "company_nit": "900123456",
-            "company_name": "Empresa Emisora",
-            "customer_id_type": "31",
-            "customer_id": "900999888",
-            "customer_name": "Cliente",
-            "customer_email": "cliente@test.com",
-            "net_amount": 100.0,
-            "tax_amount": 19.0,
-            "total_amount": 119.0,
-            "environment": "2",
-            "technical_key": "tech_key",
-            "document_type": "invoice",
-            "test_set_id": null
-        });
+    fn local_signer() -> Arc<SignerConfig> {
+        let provider = LocalCertificateProvider::from_pem(TEST_CERT_PEM.into(), TEST_KEY_PEM.into()).unwrap();
+        Arc::new(SignerConfig::new(Arc::new(provider), KeyMode::SharedLocal))
+    }
 
-        let document = Document {
-            id: doc_id,
+    /// Firmador por tenant sin certificados registrados: toda firma falla.
+    fn signer_without_certificates() -> Arc<SignerConfig> {
+        let provider = LocalCertificateProvider::from_pem(TEST_CERT_PEM.into(), TEST_KEY_PEM.into()).unwrap();
+        Arc::new(SignerConfig::new(Arc::new(provider), KeyMode::PerTenantVault))
+    }
+
+    fn document(document_type: DocumentType, payload: serde_json::Value) -> Document {
+        Document {
+            id: Uuid::new_v4(),
             tenant_id: Uuid::new_v4(),
-            document_type: DocumentType::Invoice,
+            document_type,
             prefix: "FE".to_string(),
             document_number: 1002,
             cufe_cude: "".to_string(),
@@ -716,154 +713,153 @@ mod tests {
             original_xml: None,
             signed_xml: None,
             pdf_url: None,
-            status: DocumentStatus::Draft,
+            status: DocumentStatus::Pending,
             created_at: chrono::Utc::now(),
-        };
+        }
+    }
 
-        let document_shared = Arc::new(StdMutex::new(document));
-        let saved_flag = Arc::new(StdMutex::new(false));
-        
-        let repo = Arc::new(MockRepository {
-            document: document_shared.clone(),
-            saved: saved_flag.clone(),
-        });
+    fn invoice_payload() -> serde_json::Value {
+        serde_json::json!({
+            "prefix": "FE", "number": 1002, "issue_date": "2026-05-23",
+            "issue_time": "10:42:00-05:00", "company_nit": "900123456",
+            "company_name": "Empresa Emisora", "customer_id_type": "31",
+            "customer_id": "900999888", "customer_name": "Cliente",
+            "customer_email": "cliente@test.com", "net_amount": 100.0,
+            "tax_amount": 19.0, "total_amount": 119.0, "environment": "2",
+            "technical_key": "tech_key", "document_type": "invoice", "test_set_id": null
+        })
+    }
 
-        let soap_client = Arc::new(MockSoapClient { should_fail: false });
-        let queue = Arc::new(RedisQueue::new("redis://127.0.0.1:6379", "test_queue").unwrap());
-        let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
+    fn payroll_payload() -> serde_json::Value {
+        serde_json::json!({
+            "prefix": "NOM", "number": 101, "issue_date": "2026-05-26",
+            "issue_time": "08:00:00", "employer_nit": "900123456",
+            "employer_name": "Empresa Emisora", "employee_id_type": "13",
+            "employee_id": "10203040", "employee_name": "Trabajador",
+            "devengado": 1500000.0, "deducido": 60000.0, "total": 1440000.0,
+            "software_pin": "pin_test", "environment": "2"
+        })
+    }
 
-        let processor = DocumentProcessor::new(repo, soap_client, queue, cb, 3);
-        
-        let job = Job { document_id: doc_id, attempt: 1 };
-        
-        // We call process_job. Redis connection in queue.ack will fail because there is no running Redis,
-        // but we can verify up to the point of execution. To avoid Redis dependency crashing the test,
-        // let's verify that the document is modified (CUFE generated) in the mocked DB.
-        let result = processor.process_job(job).await;
-        
-        // Since no Redis is running locally, we expect a Redis network error,
-        // but the DB should have been updated with the signed XML and status.
-        assert!(result.is_err());
-        assert!(*saved_flag.lock().unwrap());
-        let doc_after = document_shared.lock().unwrap();
-        assert_eq!(doc_after.status, DocumentStatus::Pending);
-        assert!(!doc_after.cufe_cude.is_empty());
+    fn support_payload() -> serde_json::Value {
+        serde_json::json!({
+            "prefix": "DS", "number": 200, "issue_date": "2026-05-26",
+            "issue_time": "10:30:00-05:00", "seller_nit": "10203040",
+            "seller_name": "Vendedor No Obligado", "buyer_nit": "900123456",
+            "buyer_name": "Comprador SAS", "net_amount": 100000.0,
+            "tax_amount": 19000.0, "total_amount": 119000.0,
+            "software_pin": "pin_test", "environment": "2"
+        })
+    }
+
+    struct Harness {
+        repo: Arc<InMemoryRepository>,
+        queue: Arc<RecordingQueue>,
+        processor: DocumentProcessor,
+    }
+
+    fn harness(doc: Document, signer: Arc<SignerConfig>, soap_fails: bool) -> Harness {
+        let repo = Arc::new(InMemoryRepository::with_document(doc));
+        let queue = Arc::new(RecordingQueue::default());
+        let processor = DocumentProcessor::new(
+            repo.clone(),
+            Arc::new(MockSoapClient { should_fail: soap_fails }),
+            queue.clone(),
+            signer,
+            Arc::new(CircuitBreaker::new(3, Duration::from_secs(5))),
+            3,
+        );
+        Harness { repo, queue, processor }
+    }
+
+    async fn assert_accepted_flow(document_type: DocumentType, payload: serde_json::Value) {
+        let doc = document(document_type, payload);
+        let id = doc.id;
+        let h = harness(doc, local_signer(), false);
+
+        h.processor.process_job(Job::new(id)).await.expect("job must succeed");
+
+        let saved = h.repo.document(id).unwrap();
+        assert_eq!(saved.status, DocumentStatus::DianAccepted);
+        assert_eq!(saved.cufe_cude.len(), 96);
+        assert!(saved.signed_xml.unwrap().contains("<ds:SignatureValue>"));
+        let events = h.repo.events_for(id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_status, EventStatus::Accepted);
+        assert_eq!(*h.queue.acked.lock().unwrap(), vec![Job::new(id)]);
     }
 
     #[tokio::test]
-    async fn test_process_payroll_job_success() {
-        let doc_id = Uuid::new_v4();
-        let payload = serde_json::json!({
-            "prefix": "NOM",
-            "number": 101,
-            "issue_date": "2026-05-26",
-            "issue_time": "08:00:00",
-            "employer_nit": "900123456",
-            "employer_name": "Empresa Emisora",
-            "employee_id_type": "13",
-            "employee_id": "10203040",
-            "employee_name": "Trabajador",
-            "devengado": 1500000.0,
-            "deducido": 60000.0,
-            "total": 1440000.0,
-            "software_pin": "pin_test",
-            "environment": "2"
-        });
-
-        let document = Document {
-            id: doc_id,
-            tenant_id: Uuid::new_v4(),
-            document_type: DocumentType::Payroll,
-            prefix: "NOM".to_string(),
-            document_number: 101,
-            cufe_cude: "".to_string(),
-            payload,
-            original_xml: None,
-            signed_xml: None,
-            pdf_url: None,
-            status: DocumentStatus::Draft,
-            created_at: chrono::Utc::now(),
-        };
-
-        let document_shared = Arc::new(StdMutex::new(document));
-        let saved_flag = Arc::new(StdMutex::new(false));
-        
-        let repo = Arc::new(MockRepository {
-            document: document_shared.clone(),
-            saved: saved_flag.clone(),
-        });
-
-        let soap_client = Arc::new(MockSoapClient { should_fail: false });
-        let queue = Arc::new(RedisQueue::new("redis://127.0.0.1:6379", "test_queue").unwrap());
-        let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
-
-        let processor = DocumentProcessor::new(repo, soap_client, queue, cb, 3);
-        let job = Job { document_id: doc_id, attempt: 1 };
-        
-        let result = processor.process_job(job).await;
-        
-        assert!(result.is_err()); // Redis error expected
-        assert!(*saved_flag.lock().unwrap());
-        let doc_after = document_shared.lock().unwrap();
-        assert_eq!(doc_after.status, DocumentStatus::Pending);
-        assert!(!doc_after.cufe_cude.is_empty());
+    async fn invoice_is_signed_transmitted_and_acked() {
+        assert_accepted_flow(DocumentType::Invoice, invoice_payload()).await;
     }
 
     #[tokio::test]
-    async fn test_process_support_document_job_success() {
-        let doc_id = Uuid::new_v4();
-        let payload = serde_json::json!({
-            "prefix": "DS",
-            "number": 200,
-            "issue_date": "2026-05-26",
-            "issue_time": "10:30:00-05:00",
-            "seller_nit": "10203040",
-            "seller_name": "Vendedor No Obligado",
-            "buyer_nit": "900123456",
-            "buyer_name": "Comprador SAS",
-            "net_amount": 100000.0,
-            "tax_amount": 19000.0,
-            "total_amount": 119000.0,
-            "software_pin": "pin_test",
-            "environment": "2"
-        });
+    async fn payroll_is_signed_transmitted_and_acked() {
+        assert_accepted_flow(DocumentType::Payroll, payroll_payload()).await;
+    }
 
-        let document = Document {
-            id: doc_id,
-            tenant_id: Uuid::new_v4(),
-            document_type: DocumentType::SupportDocument,
-            prefix: "DS".to_string(),
-            document_number: 200,
-            cufe_cude: "".to_string(),
-            payload,
-            original_xml: None,
-            signed_xml: None,
-            pdf_url: None,
-            status: DocumentStatus::Draft,
-            created_at: chrono::Utc::now(),
-        };
+    #[tokio::test]
+    async fn support_document_is_signed_transmitted_and_acked() {
+        assert_accepted_flow(DocumentType::SupportDocument, support_payload()).await;
+    }
 
-        let document_shared = Arc::new(StdMutex::new(document));
-        let saved_flag = Arc::new(StdMutex::new(false));
-        
-        let repo = Arc::new(MockRepository {
-            document: document_shared.clone(),
-            saved: saved_flag.clone(),
-        });
+    #[tokio::test]
+    async fn signing_failure_marks_document_failed_with_event() {
+        let doc = document(DocumentType::Invoice, invoice_payload());
+        let id = doc.id;
+        let h = harness(doc, signer_without_certificates(), false);
 
-        let soap_client = Arc::new(MockSoapClient { should_fail: false });
-        let queue = Arc::new(RedisQueue::new("redis://127.0.0.1:6379", "test_queue").unwrap());
-        let cb = Arc::new(CircuitBreaker::new(3, Duration::from_secs(5)));
+        assert!(h.processor.process_job(Job::new(id)).await.is_err());
 
-        let processor = DocumentProcessor::new(repo, soap_client, queue, cb, 3);
-        let job = Job { document_id: doc_id, attempt: 1 };
-        
-        let result = processor.process_job(job).await;
-        
-        assert!(result.is_err()); // Redis error expected
-        assert!(*saved_flag.lock().unwrap());
-        let doc_after = document_shared.lock().unwrap();
-        assert_eq!(doc_after.status, DocumentStatus::Pending);
-        assert!(!doc_after.cufe_cude.is_empty());
+        assert_eq!(h.repo.document(id).unwrap().status, DocumentStatus::ProcessingFailed);
+        let events = h.repo.events_for(id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_status, EventStatus::Error);
+        assert!(events[0]
+            .dian_response_message
+            .as_deref()
+            .unwrap()
+            .contains("no active certificate"));
+        assert_eq!(h.queue.acked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_document_type_is_marked_failed() {
+        let doc = document(DocumentType::CreditNote, invoice_payload());
+        let id = doc.id;
+        let h = harness(doc, local_signer(), false);
+
+        assert!(h.processor.process_job(Job::new(id)).await.is_err());
+
+        assert_eq!(h.repo.document(id).unwrap().status, DocumentStatus::ProcessingFailed);
+        assert_eq!(h.repo.events_for(id).len(), 1);
+        assert_eq!(h.queue.acked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_is_marked_failed_instead_of_left_in_processing() {
+        let doc = document(DocumentType::Invoice, serde_json::json!({ "unexpected": true }));
+        let id = doc.id;
+        let h = harness(doc, local_signer(), false);
+
+        assert!(h.processor.process_job(Job::new(id)).await.is_err());
+
+        assert_eq!(h.repo.document(id).unwrap().status, DocumentStatus::ProcessingFailed);
+        assert_eq!(h.queue.acked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transmission_failure_schedules_a_retry() {
+        let doc = document(DocumentType::Invoice, invoice_payload());
+        let id = doc.id;
+        let h = harness(doc, local_signer(), true);
+
+        h.processor.process_job(Job::new(id)).await.unwrap();
+
+        assert_eq!(h.repo.document(id).unwrap().status, DocumentStatus::Pending);
+        assert_eq!(h.repo.events_for(id)[0].event_status, EventStatus::Error);
+        assert_eq!(*h.queue.nacked.lock().unwrap(), vec![Job::new(id)]);
+        assert!(h.queue.acked.lock().unwrap().is_empty());
     }
 }

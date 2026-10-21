@@ -1,6 +1,7 @@
 pub mod c14n;
 pub mod error;
 pub mod provider;
+pub mod signer;
 pub mod vault;
 pub mod xades;
 
@@ -22,81 +23,65 @@ pub async fn sign_document(
 mod tests {
     use super::*;
     use provider::LocalCertificateProvider;
+    use rsa::{pkcs8::DecodePrivateKey, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+    use sha2::{Digest, Sha384};
 
-    // A mock RSA private key in PKCS#8 PEM format for testing
-    const TEST_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC6N2Hsh5q/Z24G
-eJ+jP0U40j1W8o19W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbAgMBAAECggEBAJ5T1N6X9t39k23Xm+m74v6+M2376m3P2r6t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773gQKBgQDg73t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773gQKBgQDa97du/bOu+9
-7du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97
-du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97d
-u/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97gQKBgQDZ97du/bOu+97d
-u/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du
-/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/
-bOu+97du/bOu+97du/bOu+97du/bOu+97gQKBgQC6N2Hsh5q/Z24GeJ+jP0U40j1
-W8o19W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-Yvtj22LbAgECgYEAtjdt7Ieav2duBnifoz9FONI9VvKNfVvWNqOLgt979v9i+2L7
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22Lb
------END PRIVATE KEY-----
-"#;
+    // Par de prueba desechable (ver tests/fixtures/README.md). Nunca usar en produccion.
+    const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/test_key.pem");
+    const TEST_CERT_PEM: &str = include_str!("../tests/fixtures/test_cert.pem");
 
-    // A mock certificate PEM (contains public key matching private key above)
-    // For simplicity, we just use a placeholder certificate PEM since RSA local signing only uses the private key.
-    const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIBpzCCAU+gAwIBAgIBADANBgkqhkiG9w0BAQsFADAKMQswCQYDVQQGEwJDTzAe
-Fw0yNjA1MjMwNTEzMjZaFw0yNzA1MjMwNTEzMjZaMAoxCzAJBgNVBAYTAmNPMIGf
-MA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC6N2Hsh5q/Z24GeJ+jP0U40j1W8o19
-W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbAgMBAAEwDQYJKoZIhvcNAQELBQADgYEALjdt7Ieav2duBnifoz9FONI9
-VvKNfVvWNqOLgt979v9i+2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
------END CERTIFICATE-----
-"#;
+    const XML_INPUT: &str = r#"<?xml version="1.0" encoding="UTF-8"?><Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"><cbc:ID>FE1002</cbc:ID><!-- PLACEHOLDER_FOR_SIGNATURE --></Invoice>"#;
+
+    fn test_provider() -> LocalCertificateProvider {
+        LocalCertificateProvider {
+            certificate_pem: TEST_CERT_PEM.to_string(),
+            private_key_pem: TEST_KEY_PEM.to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn test_sign_document_success() {
-        let provider = LocalCertificateProvider {
-            certificate_pem: TEST_CERT_PEM.to_string(),
-            private_key_pem: TEST_KEY_PEM.to_string(),
-        };
+        let signed_xml = sign_document(XML_INPUT, &test_provider(), "local_cert")
+            .await
+            .expect("signing with a valid key pair must succeed");
 
-        let xml_input = r#"<?xml version="1.0" encoding="UTF-8"?><Invoice><cbc:ID>FE1002</cbc:ID><!-- PLACEHOLDER_FOR_SIGNATURE --></Invoice>"#;
-
-        let result = sign_document(xml_input, &provider, "local_cert").await;
-        assert!(result.is_ok());
-
-        let signed_xml = result.unwrap();
         assert!(signed_xml.contains("<ds:Signature"));
         assert!(signed_xml.contains("<ds:SignatureValue>"));
         assert!(signed_xml.contains("<xades:SignedProperties"));
         assert!(!signed_xml.contains("<!-- PLACEHOLDER_FOR_SIGNATURE -->"));
+    }
+
+    #[tokio::test]
+    async fn test_signature_value_verifies_with_public_key() {
+        let signed_xml = sign_document(XML_INPUT, &test_provider(), "local_cert")
+            .await
+            .unwrap();
+
+        let start = signed_xml.find("<ds:SignedInfo").unwrap();
+        let end = signed_xml.find("</ds:SignedInfo>").unwrap() + "</ds:SignedInfo>".len();
+        let signed_info_c14n = c14n::canonicalize_xml(&signed_xml[start..end]).unwrap();
+        let digest = Sha384::digest(signed_info_c14n.as_bytes());
+
+        let sv_start = signed_xml.find("<ds:SignatureValue>").unwrap() + "<ds:SignatureValue>".len();
+        let sv_end = signed_xml.find("</ds:SignatureValue>").unwrap();
+        let signature = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &signed_xml[sv_start..sv_end],
+        )
+        .unwrap();
+
+        let public_key = RsaPublicKey::from(RsaPrivateKey::from_pkcs8_pem(TEST_KEY_PEM).unwrap());
+        public_key
+            .verify(Pkcs1v15Sign::new::<Sha384>(), &digest, &signature)
+            .expect("SignatureValue must verify against the SignedInfo digest");
+    }
+
+    #[tokio::test]
+    async fn test_sign_document_rejects_invalid_certificate() {
+        let provider = LocalCertificateProvider {
+            certificate_pem: "cert_dummy".to_string(),
+            private_key_pem: "key_dummy".to_string(),
+        };
+        assert!(sign_document(XML_INPUT, &provider, "local_cert").await.is_err());
     }
 }

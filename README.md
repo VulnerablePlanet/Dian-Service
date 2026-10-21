@@ -32,31 +32,46 @@ Asegúrate de contar con los siguientes elementos instalados en tu entorno:
 ## 3. Instalación y Configuración rápida
 
 ### Paso 1: Configurar la Base de Datos
-Crea una base de datos en tu servidor PostgreSQL y corre el script de migración inicial ubicado en:
-`migrations/20260523000000_init.sql`.
+Crea una base de datos en tu servidor PostgreSQL y aplica **todas** las migraciones de `migrations/` en orden de nombre:
 
-Este script creará las tablas obligatorias (`tenants`, `certificates`, `numbering_ranges`, `documents`, `dian_events`, `webhooks`) e índices optimizados de búsqueda por CUFE y multi-tenant.
+```bash
+for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+```
+
+*   `20260523000000_init.sql` crea las tablas (`tenants`, `certificates`, `numbering_ranges`, `documents`, `dian_events`, `webhooks`) y sus índices.
+*   `20261021000000_harden_documents.sql` añade el estado `processing_failed`, distingue documentos emitidos y recibidos (`direction`, `issuer_nit`) en la clave única, y cambia el borrado en cascada de documentos y eventos por `ON DELETE RESTRICT`.
 
 ### Paso 2: Configurar las Variables de Entorno
-Crea un archivo `.env` en la raíz del proyecto con la siguiente configuración:
+Los binarios leen la configuración del **entorno del proceso** (no cargan un archivo `.env` por sí mismos; usa tu orquestador, `env $(cat .env | xargs) cargo run ...` o similar). Las variables obligatorias no tienen valor por defecto: si falta alguna, el proceso termina al arrancar con un mensaje explícito.
 
 ```env
-# Base de Datos
+# --- Obligatorias (api-server y worker-redis) ---
 DATABASE_URL=postgres://tu_usuario:tu_contraseña@127.0.0.1:5432/dian
-
-# Cola de Mensajería
 REDIS_URL=redis://127.0.0.1:6379
-
-# Credenciales de Seguridad SOAP DIAN
 DIAN_BINARY_SECURITY_TOKEN=tu_certificado_x509_en_base64
 
-# Configuración de Servidor
+# --- Firma XAdES: elige UNA de las dos opciones (obligatorio) ---
+# a) Producción: certificado por tenant desde HashiCorp Vault (KV v2). Cada tenant necesita
+#    una fila activa y vigente en `certificates`; su `vault_reference_path` es la ruta del secreto
+#    (campos `certificate` y `private_key`).
+VAULT_ADDR=https://vault.example.com
+VAULT_TOKEN=...
+# b) Desarrollo: un único par local compartido por todos los tenants.
+# SIGNER_CERT_PATH=/ruta/cert.pem
+# SIGNER_KEY_PATH=/ruta/key.pem
+
+# --- Opcionales ---
 PORT=8080
 RUST_LOG=info
-
-# Límites de Concurrencia del Worker
 MAX_CONCURRENT_JOBS=5
+# Endpoints SOAP alternativos (por defecto, los oficiales de la DIAN)
+# DIAN_HAB_URL=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc
+# DIAN_PROD_URL=https://vpfe.dian.gov.co/WcfDianCustomerServices.svc
+# Solo para pruebas: habilita el registro de facturas recibidas SIN verificar su firma
+# INBOUND_ALLOW_UNVERIFIED_SIGNATURES=false
 ```
+
+Si la firma de un documento falla (por ejemplo, el tenant no tiene un certificado activo y vigente), el documento pasa a `processing_failed` y el motivo queda en `dian_events`.
 
 ### Paso 3: Compilar y Ejecutar
 
@@ -124,11 +139,15 @@ El servidor REST valida el JSON localmente en microsegundos, lo guarda en Postgr
 
 Posteriormente, el worker asíncrono se encarga del cálculo de CUFE, firmado XAdES-EPES, empaquetado ZIP y transmisión a la DIAN.
 
+> **Limitación actual:** `document_type` solo admite `"invoice"`. Las notas crédito y débito (`credit_note`, `debit_note`) se rechazan con `422` hasta que tengan su propia plantilla UBL (con `BillingReference`) y su CUDE.
+
 ---
 
 ### B. Notificaciones de Estado mediante Webhooks
 
-En lugar de forzar a tu ERP a hacer peticiones continuas (*polling*) para saber si la DIAN aceptó o rechazó la factura, `Dian_Service` enviará una petición asíncrona HTTP POST a la URL de Webhook registrada en tu Tenant.
+> **Estado: aún no implementado.** La firma HMAC descrita abajo existe en el código (`api-server/src/webhook.rs`), pero todavía no se despacha ninguna notificación. Mientras tanto, consulta el estado con `GET /api/v1/documents/:id`.
+
+El objetivo es que, en lugar de forzar a tu ERP a hacer peticiones continuas (*polling*), `Dian_Service` envíe una petición HTTP POST a la URL de Webhook registrada en tu Tenant.
 
 #### Seguridad del Webhook (Verificación de Integridad):
 Para certificar que la notificación proviene de tu servidor y no de un tercero malintencionado, la API calcula una firma **HMAC-SHA256** del payload y la inyecta en la cabecera:
@@ -151,17 +170,21 @@ Para registrar las facturas que te emiten tus proveedores y habilitar el RADIAN,
 }
 ```
 
-*   **Qué hace Dian_Service internamente:**
-    1.  Descomprime el ZIP en memoria.
-    2.  Valida criptográficamente la firma digital del `AttachedDocument`.
+> **Estado: deshabilitado por defecto (`501 Not Implemented`).** La verificación criptográfica de la firma del `AttachedDocument` todavía no está implementada; sin ella no es posible distinguir una factura legítima de una fabricada. Para pruebas se puede habilitar con `INBOUND_ALLOW_UNVERIFIED_SIGNATURES=true`: los documentos quedan marcados como no verificados (`signature_verified: false`) y **no admiten eventos RADIAN**.
+
+*   **Qué hace Dian_Service internamente (cuando está habilitado):**
+    1.  Descomprime el ZIP en memoria, con un límite de 10 MiB descomprimidos y 20 entradas.
+    2.  Comprueba que el XML contenga una firma (solo presencia, **no** verificación criptográfica).
     3.  Verifica que la respuesta DIAN embebida tenga un `ResponseCode` de `"02"` (Aceptación DIAN).
-    4.  Extrae los metadatos e introduce el documento en Postgres con estado `dian_accepted`.
+    4.  Inserta el documento como recibido (`direction = inbound`, `issuer_nit` = NIT del emisor). Si esa factura del mismo emisor ya estaba registrada, responde `409 Conflict`; nunca sobrescribe otro documento.
 
 ---
 
 ### D. Registro de Eventos RADIAN (Título Valor)
 
 Una vez ingresada la factura del proveedor (inbound), puedes formalizar eventos legales ante el RADIAN para su circulación.
+
+> Solo se admiten eventos sobre facturas recibidas cuya firma fue verificada. Mientras la verificación no esté implementada (ver sección C), este endpoint responde `422` para todas las facturas recibidas.
 
 *   **Endpoint:** `POST /api/v1/documents/:id/events`
 *   **Payload JSON:**

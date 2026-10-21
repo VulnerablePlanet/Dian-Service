@@ -27,6 +27,8 @@ impl VaultClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| CryptoError::Vault(format!("Failed to build HTTP client: {}", e)))?;
 

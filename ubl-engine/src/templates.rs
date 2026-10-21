@@ -13,25 +13,27 @@ impl Default for TemplateEngine {
 
 impl TemplateEngine {
     pub fn new() -> Self {
+        // Los nombres terminan en `.xml` para que MiniJinja active el autoescape: todos los
+        // valores interpolados (nombres, NIT, XML embebido) se escapan como texto.
         let mut env = Environment::new();
         let template_str = include_str!("../templates/invoice_template.xml");
-        env.add_template("invoice", template_str)
+        env.add_template("invoice.xml", template_str)
             .expect("Failed to add invoice template");
 
         let att_doc_str = include_str!("../templates/attached_document_template.xml");
-        env.add_template("attached_document", att_doc_str)
+        env.add_template("attached_document.xml", att_doc_str)
             .expect("Failed to add attached_document template");
 
         let app_resp_str = include_str!("../templates/application_response_template.xml");
-        env.add_template("application_response", app_resp_str)
+        env.add_template("application_response.xml", app_resp_str)
             .expect("Failed to add application_response template");
 
         let payroll_str = include_str!("../templates/payroll_template.xml");
-        env.add_template("payroll", payroll_str)
+        env.add_template("payroll.xml", payroll_str)
             .expect("Failed to add payroll template");
 
         let support_doc_str = include_str!("../templates/support_document_template.xml");
-        env.add_template("support_document", support_doc_str)
+        env.add_template("support_document.xml", support_doc_str)
             .expect("Failed to add support_document template");
 
         Self { env }
@@ -57,7 +59,7 @@ impl TemplateEngine {
         tax_amount: f64,
         total_amount: f64,
     ) -> Result<String, UblError> {
-        let tmpl = self.env.get_template("invoice")?;
+        let tmpl = self.env.get_template("invoice.xml")?;
 
         let net_amount_str = format!("{:.2}", net_amount);
         let tax_amount_str = format!("{:.2}", tax_amount);
@@ -103,7 +105,7 @@ impl TemplateEngine {
         signed_invoice_xml: &str,
         dian_response_xml: &str,
     ) -> Result<String, UblError> {
-        let tmpl = self.env.get_template("attached_document")?;
+        let tmpl = self.env.get_template("attached_document.xml")?;
 
         let rendered = tmpl.render(context! {
             UniqueID => unique_id,
@@ -143,7 +145,7 @@ impl TemplateEngine {
         parent_document_id: &str,
         parent_document_uuid: &str,
     ) -> Result<String, UblError> {
-        let tmpl = self.env.get_template("application_response")?;
+        let tmpl = self.env.get_template("application_response.xml")?;
 
         let rendered = tmpl.render(context! {
             ID => id,
@@ -181,7 +183,7 @@ impl TemplateEngine {
         deducido: f64,
         total: f64,
     ) -> Result<String, UblError> {
-        let tmpl = self.env.get_template("payroll")?;
+        let tmpl = self.env.get_template("payroll.xml")?;
 
         let devengado_str = format!("{:.2}", devengado);
         let deducido_str = format!("{:.2}", deducido);
@@ -221,7 +223,7 @@ impl TemplateEngine {
         tax_amount: f64,
         total_amount: f64,
     ) -> Result<String, UblError> {
-        let tmpl = self.env.get_template("support_document")?;
+        let tmpl = self.env.get_template("support_document.xml")?;
 
         let net_amount_str = format!("{:.2}", net_amount);
         let tax_amount_str = format!("{:.2}", tax_amount);
