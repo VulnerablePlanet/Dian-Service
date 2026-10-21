@@ -1,0 +1,21 @@
+# Advisories aceptadas explícitamente. Cada entrada documenta por qué no aplica o por qué
+# se acepta temporalmente, y qué la resolvería. Revisar en cada actualización de dependencias.
+[advisories]
+ignore = [
+    # rsa 0.9 — Marvin Attack (canal lateral de tiempo). No existe versión corregida.
+    # Hoy las firmas PKCS#1 v1.5 se calculan en proceso: VaultCertificateProvider descarga la
+    # llave y firma localmente. Se resuelve firmando dentro de Vault Transit o un HSM (fase F4
+    # del plan), de modo que la llave privada nunca esté en este proceso.
+    "RUSTSEC-2023-0071",
+
+    # quick-xml 0.39 (vía xml-canonicalization 0.1.2, última versión publicada).
+    # 0194: coste cuadrático con atributos duplicados. 0195: asignación ilimitada en `NsReader`.
+    # xml-canonicalization usa `Reader` (no `NsReader`) y solo canonicaliza XML generado por
+    # nuestras plantillas (valores escapados) y por el propio firmador, nunca XML de terceros.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # webpki-roots 0.26.11 es un "semver trick" que reexporta webpki-roots 1.x; el lockfile
+    # resuelve 1.0.10, que ya contiene la corrección. El aviso salta solo por el rango 0.26.x.
+    "RUSTSEC-2026-0381",
+]
