@@ -8,14 +8,24 @@ Este proyecto está diseñado para funcionar como un microservicio independiente
 
 ## 1. Arquitectura Hexagonal y Estructura
 
-El repositorio está organizado como un **Cargo Workspace** compuesto por sub-crates altamente desacoplados:
+El repositorio es un **Cargo Workspace**. Las dependencias apuntan hacia el dominio: los binarios solo traducen HTTP o la cola a casos de uso, y la infraestructura implementa los puertos del dominio.
 
-*   **`core-domain`**: Contiene los modelos de datos puros (Factura, Certificados, Rangos de Numeración, Eventos) y los Puertos (Traits en Rust) que definen los enchufes de salida del sistema.
-*   **`ubl-engine`**: Motor de plantillas XML UBL 2.1 (basado en MiniJinja con plantillas compiladas en el binario mediante `include_str!`) y lógicas matemáticas para el cálculo determinista de CUFE/CUDE/CUDS/CUNE.
-*   **`crypto-signer`**: Módulo criptográfico encargado de la canonicalización XML exclusiva (C14N) y firma avanzada **XAdES-EPES** utilizando firmas envolventes RSA + SHA-256. Soporta HashiCorp Vault e implementación offline local.
-*   **`dian-soap-client`**: Adaptador cliente SOAP v1.2 con WS-Security y WS-Addressing para interactuar de forma segura con los Web Services oficiales de la DIAN.
-*   **`worker-redis`**: Background worker asíncrono y resiliente que gestiona las colas de transmisión confiables (BRPOPLPUSH), backoff exponencial con jitter para fallos de red y disyuntores (*Circuit Breakers*) atómicos para contingencias tecnológicas.
-*   **`api-server`**: Servidor REST expuesto en HTTP (basado en Axum) que gestiona la autenticación multi-tenant y expone las interfaces de consumo e ingesta.
+```
+api-server ─┐                 ┌─► infra-postgres   (puertos de persistencia y cola)
+            ├─► application ──┤─► crypto-signer    (puerto CryptoSigner)
+worker ─────┘        │        └─► dian-soap-client (puerto DianSoapClient)
+                     ▼
+               core-domain  ◄── ubl-engine
+```
+
+*   **`core-domain`**: modelos, reglas de negocio puras y puertos (traits). No depende de base de datos ni de HTTP. Contiene la máquina de estados del documento (`lifecycle`), las reglas de numeración (`numbering`) y los montos en `Decimal` (`money`).
+*   **`application`**: casos de uso: emisión (`IssueService`, con idempotencia), procesamiento de la cola (`DocumentProcessor`: firma, transmisión, consulta de estado, contingencia), facturas recibidas y eventos RADIAN. También el circuit breaker por ambiente y el backoff.
+*   **`infra-postgres`**: adaptador PostgreSQL de los puertos: emisión atómica, transiciones de estado condicionales y la cola de trabajos (`FOR UPDATE SKIP LOCKED`, leases). Embebe las migraciones.
+*   **`ubl-engine`**: plantillas XML UBL 2.1 (MiniJinja, con autoescape), cálculo de CUFE/CUDE/CUDS/CUNE y empaquetado ZIP.
+*   **`crypto-signer`**: canonicalización C14N y firma **XAdES-EPES** (RSA + SHA-384), con certificado por tenant desde HashiCorp Vault o un par local para desarrollo.
+*   **`dian-soap-client`**: cliente SOAP 1.2 (WS-Addressing, timeouts) para los Web Services de la DIAN.
+*   **`api-server`**: servidor REST (Axum) con autenticación por tenant.
+*   **`worker`**: proceso que reclama y procesa los trabajos de la cola.
 
 ---
 
@@ -24,8 +34,7 @@ El repositorio está organizado como un **Cargo Workspace** compuesto por sub-cr
 Asegúrate de contar con los siguientes elementos instalados en tu entorno:
 
 *   **Rust Compiler** (Edición 2021 o superior)
-*   **PostgreSQL** (Esquema relacional con soporte JSONB)
-*   **Redis** (Para orquestación y colas asíncronas)
+*   **PostgreSQL 13 o superior** (datos y cola de trabajos; ya no se requiere Redis)
 
 ---
 
@@ -40,14 +49,14 @@ for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP
 
 *   `20260523000000_init.sql` crea las tablas (`tenants`, `certificates`, `numbering_ranges`, `documents`, `dian_events`, `webhooks`) y sus índices.
 *   `20261021000000_harden_documents.sql` añade el estado `processing_failed`, distingue documentos emitidos y recibidos (`direction`, `issuer_nit`) en la clave única, y cambia el borrado en cascada de documentos y eventos por `ON DELETE RESTRICT`.
+*   `20261023000000_jobs_and_idempotency.sql` crea la cola de trabajos (`jobs`) y las claves de idempotencia (`idempotency_keys`), y asocia cada documento a su resolución de numeración. Si actualizas desde la versión con Redis, encola automáticamente los documentos que estaban en curso.
 
 ### Paso 2: Configurar las Variables de Entorno
 Los binarios leen la configuración del **entorno del proceso** (no cargan un archivo `.env` por sí mismos; usa tu orquestador, `env $(cat .env | xargs) cargo run ...` o similar). Las variables obligatorias no tienen valor por defecto: si falta alguna, el proceso termina al arrancar con un mensaje explícito.
 
 ```env
-# --- Obligatorias (api-server y worker-redis) ---
+# --- Obligatorias (api-server y worker) ---
 DATABASE_URL=postgres://tu_usuario:tu_contraseña@127.0.0.1:5432/dian
-REDIS_URL=redis://127.0.0.1:6379
 DIAN_BINARY_SECURITY_TOKEN=tu_certificado_x509_en_base64
 
 # --- Firma XAdES: elige UNA de las dos opciones (obligatorio) ---
@@ -63,7 +72,18 @@ VAULT_TOKEN=...
 # --- Opcionales ---
 PORT=8080
 RUST_LOG=info
-MAX_CONCURRENT_JOBS=5
+DATABASE_MAX_CONNECTIONS=10
+# Worker
+MAX_CONCURRENT_JOBS=5                    # trabajos procesados en paralelo
+TRANSMIT_MAX_ATTEMPTS=5                  # intentos antes de pasar a contingencia (api-server y worker)
+POLL_MAX_ATTEMPTS=30                     # consultas de estado de un envío asíncrono
+JOB_LEASE_SECS=600                       # tras este tiempo, un trabajo de un worker caído se retoma
+JOB_TIMEOUT_SECS=540                     # debe ser menor que JOB_LEASE_SECS
+CONTINGENCY_REQUEUE_INTERVAL_SECS=300    # reproceso automático de documentos en contingencia
+BREAKER_FAILURE_THRESHOLD=3
+BREAKER_COOLDOWN_SECS=30
+SHUTDOWN_GRACE_SECS=120
+POLL_INTERVAL_MS=1000
 # Endpoints SOAP alternativos (por defecto, los oficiales de la DIAN)
 # DIAN_HAB_URL=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc
 # DIAN_PROD_URL=https://vpfe.dian.gov.co/WcfDianCustomerServices.svc
@@ -81,9 +101,9 @@ El proyecto se divide en dos binarios independientes:
     ```bash
     cargo run --bin api-server
     ```
-2.  **Ejecutar el Background Worker (worker-redis)**:
+2.  **Ejecutar el worker** (se pueden levantar varias instancias; la cola reparte los trabajos sin duplicarlos):
     ```bash
-    cargo run --bin worker-redis
+    cargo run --bin worker
     ```
 
 ---
@@ -119,23 +139,30 @@ Cuando tu ERP o POS genera una venta, debes enviar la información estructurada 
   "tax_amount": 19000.00,
   "total_amount": 119000.00,
   "environment": "2",
-  "technical_key": "clave_tecnica_dian_o_pin",
   "document_type": "invoice",
   "test_set_id": null
 }
 ```
 
+*   **Reglas de validación:**
+    *   `number` debe ser **exactamente el siguiente consecutivo** de la resolución vigente del prefijo (no se admiten saltos). La resolución debe estar vigente y no agotada.
+    *   Los montos admiten como máximo dos decimales y deben cuadrar: `total_amount = net_amount + tax_amount`.
+    *   La clave técnica del CUFE se toma de la resolución de numeración (`numbering_ranges.technical_key`). El campo `technical_key` del cuerpo es obsoleto: se acepta, se ignora y no se guarda.
+*   **Idempotencia (recomendado):** envía la cabecera `Idempotency-Key: <identificador único de la venta>`. Si el ERP reintenta con la misma clave y el mismo cuerpo, recibe la misma respuesta (con la cabecera `Idempotent-Replayed: true`) sin crear otro documento ni consumir otro consecutivo. La misma clave con un cuerpo distinto responde `422`.
 *   **Respuesta de la API (HTTP 202 Accepted):**
 
-El servidor REST valida el JSON localmente en microsegundos, lo guarda en PostgreSQL en estado `Pending`, inyecta el trabajo en la cola de Redis y responde de inmediato al ERP:
+En una sola transacción de PostgreSQL se asigna el consecutivo, se guarda el documento en estado `pending` y se encola su trabajo de transmisión; después se responde al ERP:
 
 ```json
 {
   "document_id": "fe9b0d4e-b5c1-4b2a-8cfa-d0ad28c46001",
+  "document_number": 1002,
   "status": "QUEUED",
   "message": "Factura encolada correctamente para su firmado y transmision"
 }
 ```
+
+*   **Códigos de error:** `401` API key inválida · `403` el NIT emisor no es el del tenant · `404` documento inexistente · `409` conflicto · `422` validación · `501` funcionalidad deshabilitada · `502` error de la DIAN · `503` base de datos no disponible (reintentable). Los errores `5xx` no incluyen detalles internos.
 
 Posteriormente, el worker asíncrono se encarga del cálculo de CUFE, firmado XAdES-EPES, empaquetado ZIP y transmisión a la DIAN.
 
@@ -231,7 +258,7 @@ Envía reportes de nómina individual a la DIAN.
 }
 ```
 
-*   **Respuesta (HTTP 202 Accepted):** Retorna `document_id` y encola el trabajo en Redis, calculando el CUNE (SHA-384) y firmando el reporte en segundo plano.
+*   **Respuesta (HTTP 202 Accepted):** Retorna `document_id` y `document_number`; el worker calcula el CUNE (SHA-384), firma y transmite en segundo plano. Al igual que en facturas, `number` debe ser el siguiente consecutivo, `total` debe ser `devengado - deducido` y se admite `Idempotency-Key`.
 
 ---
 
@@ -259,7 +286,7 @@ Registra transacciones de compras realizadas a sujetos no obligados a facturar.
 }
 ```
 
-*   **Respuesta (HTTP 202 Accepted):** El servidor reserva el consecutivo atómico (ej: 200) y responde:
+*   **Respuesta (HTTP 202 Accepted):** El servidor **asigna** el consecutivo (el `number` del cuerpo se ignora; el primer documento de un rango que empieza en 5000 recibe 5000) y responde:
 ```json
 {
   "document_id": "673f4e2b-f119-4a94-87cf-45de09bc8720",
@@ -276,27 +303,29 @@ Registra transacciones de compras realizadas a sujetos no obligados a facturar.
 Permite consultar el estado operativo de las dependencias clave.
 
 *   **Endpoint:** `GET /api/v1/health` (Acceso público, no requiere API Key)
-*   **Respuesta (HTTP 200 OK):**
-```json
-{
-  "status": "UP",
-  "database": "CONNECTED",
-  "redis": "CONNECTED"
-}
-```
+*   **Respuesta:** `200 OK` con `{"status": "UP", "database": "CONNECTED"}`, o `503 Service Unavailable` con `{"status": "DOWN", "database": "DISCONNECTED"}` si PostgreSQL no responde.
 
 ---
 
-## 5. Arquitectura de Numeración Concurrente y Resiliencia
+## 5. Numeración, cola de trabajos y resiliencia
 
-El motor incluye optimizaciones avanzadas para prevenir fallos bajo alta concurrencia y garantizar la secuencia de numeración exigida por la DIAN:
+1.  **Emisión atómica.** Asignar el consecutivo (bloqueo `SELECT ... FOR UPDATE` corto sobre la resolución vigente), insertar el documento, encolar su trabajo y registrar la clave de idempotencia ocurren en **una sola transacción**. No puede existir un documento sin trabajo ni un consecutivo consumido por una solicitud que falló.
+2.  **Cola persistente en PostgreSQL (tabla `jobs`).** Los workers reclaman trabajos con `FOR UPDATE SKIP LOCKED`, de modo que varias instancias se reparten la carga sin procesar dos veces el mismo trabajo. Un índice único impide que un documento tenga dos trabajos activos del mismo tipo.
+3.  **Leases.** Cada trabajo reclamado tiene un lease (`JOB_LEASE_SECS`). Si un worker muere a mitad de un envío, otro retoma el trabajo cuando el lease vence. Los reintentos se programan en la base de datos (`run_at`) con backoff exponencial y jitter, así que sobreviven a reinicios.
+4.  **Sin reenvíos duplicados.** El XML firmado se guarda tras el primer intento y se reutiliza. Antes de reenviar en un reintento se consulta `GetStatus` con el CUFE: si la DIAN ya aceptó el documento, se marca como aceptado sin volver a transmitirlo.
+5.  **Máquina de estados.** Cada cambio de estado se aplica solo si el estado actual lo permite, junto con su evento y el cierre del trabajo, en la misma transacción. Así, por ejemplo, un documento ya enviado no puede retroceder a contingencia.
+6.  **Contingencia.** Si un documento agota `TRANSMIT_MAX_ATTEMPTS`, pasa a `contingency_pending` y su trabajo queda en estado `dead` para revisión. El worker vuelve a encolar periódicamente esos documentos (`CONTINGENCY_REQUEUE_INTERVAL_SECS`).
+7.  **Circuit breaker por ambiente.** Habilitación y producción tienen breakers independientes. Mientras un breaker está abierto, los trabajos se aplazan sin consumir intentos. En estado medio abierto solo pasa una petición de prueba.
+8.  **Consulta de estado acotada.** Los envíos asíncronos (set de pruebas) se consultan con `GetStatusZip` hasta `POLL_MAX_ATTEMPTS`. Al agotarse, el trabajo queda `dead` y se registra un evento `POLLING_EXHAUSTED`.
+9.  **Apagado ordenado.** Ante SIGTERM, el worker deja de reclamar y espera a que terminen los trabajos en curso (`SHUTDOWN_GRACE_SECS`). El API deja de aceptar conexiones y termina las solicitudes en curso.
 
-1.  **Bloqueo Pesimista Corto (`SELECT ... FOR UPDATE`)**:
-    Los endpoints `POST /api/v1/invoices`, `POST /api/v1/payroll` y `POST /api/v1/support-documents` inician una transacción corta de base de datos y bloquean de forma exclusiva la fila del rango de numeración del Tenant. El consecutivo es validado e incrementado de forma segura, y la transacción se confirma (`commit`) inmediatamente. Esto libera los locks en menos de `10ms`, mucho antes de iniciar operaciones de red lentas con Redis o SOAP de la DIAN.
-2.  **Control de Concurrencia de Transmisión**:
-    El background worker (`worker-redis`) utiliza un semáforo asíncrono (`tokio::sync::Semaphore`) limitado por `MAX_CONCURRENT_JOBS` para controlar el número de peticiones SOAP enviadas en paralelo a la DIAN. Esto evita sobrecargar la red y previene timeouts.
-3.  **Monitoreo Proactivo**:
-    El worker chequea la salud de PostgreSQL y Redis antes de de-encolar nuevos trabajos, transicionando a esperas con backoff si alguna dependencia crítica se desconecta.
+Los trabajos en estado `dead` forman la cola de revisión manual:
+
+```sql
+SELECT j.kind, j.attempts, j.last_error, d.prefix, d.document_number, d.status
+FROM jobs j JOIN documents d ON d.id = j.document_id
+WHERE j.status = 'dead' ORDER BY j.updated_at DESC;
+```
 
 ---
 
