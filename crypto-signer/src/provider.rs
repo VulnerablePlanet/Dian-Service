@@ -3,15 +3,15 @@ use crate::vault::VaultClient;
 use async_trait::async_trait;
 use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey, RsaPrivateKey};
 use rsa::Pkcs1v15Sign;
-use sha2::Sha384;
+use sha2::Sha256;
 
 #[async_trait]
 pub trait CertificateProvider: Send + Sync {
     /// Obtiene el certificado digital en formato PEM (codificado en Base64).
     async fn get_certificate(&self, key_ref: &str) -> Result<String, CryptoError>;
 
-    /// Firma un hash pre-calculado (SHA-384) usando la llave privada.
-    async fn sign_hash(&self, key_ref: &str, sha384_hash: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    /// Firma (RSA PKCS#1 v1.5) un digest SHA-256 ya calculado.
+    async fn sign_sha256(&self, key_ref: &str, digest: &[u8]) -> Result<Vec<u8>, CryptoError>;
 }
 
 /// Proveedor local para desarrollo/tests que almacena las llaves en memoria
@@ -40,11 +40,11 @@ impl CertificateProvider for LocalCertificateProvider {
         Ok(clean_pem(&self.certificate_pem))
     }
 
-    async fn sign_hash(&self, _key_ref: &str, sha384_hash: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    async fn sign_sha256(&self, _key_ref: &str, digest: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let private_key = parse_pem_private_key(&self.private_key_pem)?;
         
         let signature = private_key
-            .sign(Pkcs1v15Sign::new::<Sha384>(), sha384_hash)
+            .sign(Pkcs1v15Sign::new::<Sha256>(), digest)
             .map_err(|e| CryptoError::Signing(format!("RSA signing failed: {}", e)))?;
 
         Ok(signature)
@@ -74,7 +74,7 @@ impl CertificateProvider for VaultCertificateProvider {
         Ok(clean_pem(cert))
     }
 
-    async fn sign_hash(&self, key_ref: &str, sha384_hash: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    async fn sign_sha256(&self, key_ref: &str, digest: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let secret = self.client.read_secret(key_ref).await?;
         let key_pem = secret
             .get("private_key")
@@ -84,7 +84,7 @@ impl CertificateProvider for VaultCertificateProvider {
         let private_key = parse_pem_private_key(key_pem)?;
         
         let signature = private_key
-            .sign(Pkcs1v15Sign::new::<Sha384>(), sha384_hash)
+            .sign(Pkcs1v15Sign::new::<Sha256>(), digest)
             .map_err(|e| CryptoError::Signing(format!("RSA signing with Vault key failed: {}", e)))?;
 
         Ok(signature)

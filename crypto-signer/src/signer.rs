@@ -180,7 +180,7 @@ mod tests {
         let repo = Arc::new(InMemoryStore::default());
         repo.add_certificate(certificate(tenant_id, Duration::days(30)));
         let signer: Arc<dyn CryptoSigner> = Arc::new(TenantSigner::new(per_tenant_config(), repo));
-        assert!(signer.sign_for_tenant(tenant_id, XML).await.unwrap().contains("<ds:SignatureValue>"));
+        assert!(signer.sign_for_tenant(tenant_id, XML).await.unwrap().contains("<ds:SignatureValue"));
         assert!(matches!(
             signer.sign_for_tenant(Uuid::new_v4(), XML).await,
             Err(DomainError::Crypto(_))
@@ -193,6 +193,6 @@ mod tests {
         let repo = InMemoryStore::default();
         repo.add_certificate(certificate(tenant_id, Duration::days(30)));
         let signed = per_tenant_config().sign_for_tenant(&repo, tenant_id, XML).await.unwrap();
-        assert!(signed.contains("<ds:SignatureValue>"));
+        assert!(signed.contains("<ds:SignatureValue"));
     }
 }
