@@ -1,7 +1,7 @@
 //! Caso de uso: eventos RADIAN sobre facturas recibidas (ApplicationResponse).
 //!
-//! Sigue siendo síncrono: solo se admite sobre facturas cuya firma fue verificada, y esa
-//! verificación aún no existe, de modo que hoy toda solicitud termina en `Validation`.
+//! Síncrono. Solo se admite sobre facturas recibidas cuya firma fue verificada
+//! criptográficamente (`InboundService::register_verified`).
 
 use chrono::Utc;
 use core_domain::models::{DianEvent, EventStatus, Tenant};

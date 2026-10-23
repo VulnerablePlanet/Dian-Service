@@ -14,8 +14,10 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+quick-xml = { workspace = true }
 rand = "0.8"
 
 [dev-dependencies]
 core-domain = { path = "../core-domain", features = ["testing"] }
 zip = { workspace = true }
+crypto-signer = { path = "../crypto-signer" }

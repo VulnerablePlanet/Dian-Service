@@ -18,8 +18,8 @@ uuid = { workspace = true }
 quick-xml = { workspace = true }
 x509-cert = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 ubl-engine = { path = "../ubl-engine" }
-tokio = { workspace = true }
 core-domain = { path = "../core-domain", features = ["testing"] }

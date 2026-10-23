@@ -138,6 +138,9 @@ fn config() -> ApiConfig {
         dian_prod_url: None,
         inbound_allow_unverified_signatures: false,
         transmit_max_attempts: 5,
+        inbound_trusted_ca_pem: None,
+        inbound_intermediates_pem: None,
+        inbound_dian_signer_subject: "800197268".into(),
     }
 }
 
@@ -147,7 +150,7 @@ fn app_with(documents: Arc<dyn DocumentRepository>, health: Arc<dyn HealthProbe>
         documents: documents.clone(),
         health,
         issue: IssueService::new(documents.clone(), 5),
-        inbound: InboundService::new(documents.clone()),
+        inbound: InboundService::new(documents.clone(), None),
         radian: RadianService::new(documents, Arc::new(NoSigner), Arc::new(NoSoap)),
         config: config(),
     }))

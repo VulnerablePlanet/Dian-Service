@@ -9,6 +9,10 @@
 
 use crate::error::CryptoError;
 use crate::xades::{ALG_ENVELOPED, NS_DS};
+use async_trait::async_trait;
+use core_domain::ports::{DomainError, SignatureVerifier, VerifiedSignature};
+use base64::Engine;
+use x509_cert::der::Decode;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
 use quick_xml::NsReader;
@@ -115,6 +119,83 @@ impl XmlSignatureVerifier {
             "Signature verification failed{}",
             if reason.is_empty() { String::new() } else { format!(": {}", reason) }
         )))
+    }
+}
+
+#[async_trait]
+impl SignatureVerifier for XmlSignatureVerifier {
+    async fn verify(&self, xml: &str) -> Result<VerifiedSignature, DomainError> {
+        let verifier = self.clone();
+        let xml = xml.to_string();
+        tokio::task::spawn_blocking(move || {
+            XmlSignatureVerifier::verify(&verifier, &xml)?;
+            Ok(VerifiedSignature {
+                signer_subject: signer_subject(&xml)?,
+            })
+        })
+            .await
+            .map_err(|e| DomainError::Internal(format!("signature verification task failed: {}", e)))?
+            .map_err(|e| match e {
+                // Firma ausente, inválida, no confiable o estructura no admitida: culpa del documento.
+                CryptoError::Signing(message) | CryptoError::Xml(message) => DomainError::Validation(message),
+                other => DomainError::Crypto(other.to_string()),
+            })
+    }
+}
+
+/// Sujeto del certificado firmante: el certificado de `ds:KeyInfo` que no emitió a ningún
+/// otro de los incluidos (el de entidad final cuando viaja la cadena).
+pub fn signer_subject(xml: &str) -> Result<String, CryptoError> {
+    let mut reader = NsReader::from_str(xml);
+    let mut in_key_info = false;
+    let mut in_certificate = false;
+    let mut encoded: Vec<String> = Vec::new();
+    loop {
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|e| CryptoError::Xml(format!("Invalid XML: {}", e)))?;
+        let is_ds = matches!(resolved, ResolveResult::Bound(ns) if ns.as_ref() == NS_DS);
+        match event {
+            Event::Start(ref e) if is_ds && e.local_name().as_ref() == "KeyInfo" => in_key_info = true,
+            Event::End(ref e) if is_ds && e.local_name().as_ref() == "KeyInfo" => in_key_info = false,
+            Event::Start(ref e) if in_key_info && is_ds && e.local_name().as_ref() == "X509Certificate" => {
+                in_certificate = true;
+                encoded.push(String::new());
+            }
+            Event::End(ref e) if is_ds && e.local_name().as_ref() == "X509Certificate" => in_certificate = false,
+            Event::Text(ref t) if in_certificate => {
+                let text: &str = t.as_ref();
+                if let Some(last) = encoded.last_mut() {
+                    last.push_str(text);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    let mut names = Vec::new();
+    for b64 in &encoded {
+        let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .map_err(|e| CryptoError::Signing(format!("KeyInfo certificate is not valid Base64: {}", e)))?;
+        let certificate = x509_cert::Certificate::from_der(&der)
+            .map_err(|e| CryptoError::Signing(format!("KeyInfo certificate is not valid X.509: {}", e)))?;
+        names.push((
+            certificate.tbs_certificate.subject.to_string(),
+            certificate.tbs_certificate.issuer.to_string(),
+        ));
+    }
+    let leaves: Vec<&String> = names
+        .iter()
+        .filter(|(subject, _)| !names.iter().any(|(other, issuer)| issuer == subject && other != subject))
+        .map(|(subject, _)| subject)
+        .collect();
+    match leaves.as_slice() {
+        [leaf] => Ok((*leaf).clone()),
+        [] => Err(CryptoError::Signing("The signature does not include the signer certificate".to_string())),
+        _ => Err(CryptoError::Signing("The signature includes more than one end-entity certificate".to_string())),
     }
 }
 

@@ -39,18 +39,30 @@ pub async fn receive_inbound_invoice(
     Extension(tenant): Extension<Tenant>,
     Json(payload): Json<InboundInvoicePayload>,
 ) -> Result<Json<Value>, ApiError> {
-    // La verificación criptográfica de la firma aún no está implementada: sin ella no se
-    // puede distinguir una factura legítima de una fabricada.
+    let zip_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.zip_content)
+        .map_err(|e| validation(format!("Contenido ZIP Base64 invalido: {}", e)))?;
+
+    // Con verificación configurada se exige siempre; el registro sin verificar es solo para
+    // ambientes de prueba y deja el documento inhabilitado para eventos RADIAN.
+    if state.inbound.can_verify() {
+        let xml = extract_first_xml(&zip_bytes)?;
+        let registered = state.inbound.register_verified(&tenant, xml).await?;
+        return Ok(Json(json!({
+            "document_id": registered.document_id,
+            "parent_document_id": registered.parent_document_id,
+            "status": "ACCEPTED_AND_STORED",
+            "signature_verified": true,
+            "message": "Factura de proveedor verificada (firmas del emisor y de la DIAN) y registrada"
+        })));
+    }
     if !state.config.inbound_allow_unverified_signatures {
         return Err(ApiError::NotImplemented(
-            "El registro de facturas recibidas está deshabilitado hasta implementar la \
-             verificación criptográfica de la firma del AttachedDocument"
+            "El registro de facturas recibidas requiere configurar INBOUND_TRUSTED_CA_PEM \
+             (verificación criptográfica de las firmas)"
                 .to_string(),
         ));
     }
 
-    let zip_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload.zip_content)
-        .map_err(|e| validation(format!("Contenido ZIP Base64 invalido: {}", e)))?;
     let xml = extract_first_xml(&zip_bytes)?;
     let registered = state.inbound.register_unverified(&tenant, xml).await?;
 

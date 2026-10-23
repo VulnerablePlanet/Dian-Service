@@ -88,7 +88,12 @@ POLL_INTERVAL_MS=1000
 # Endpoints SOAP alternativos (por defecto, los oficiales de la DIAN)
 # DIAN_HAB_URL=https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc
 # DIAN_PROD_URL=https://vpfe.dian.gov.co/WcfDianCustomerServices.svc
-# Solo para pruebas: habilita el registro de facturas recibidas SIN verificar su firma
+# Facturas recibidas: bundle PEM de CAs de confianza (CAs acreditadas ONAC + CA de la DIAN).
+# Habilita la verificación criptográfica (requiere `xmlsec1` instalado; se comprueba al arrancar).
+# INBOUND_TRUSTED_CA_PEM=/etc/dian/trusted-cas.pem
+# INBOUND_INTERMEDIATES_PEM=/etc/dian/intermediates.pem
+# INBOUND_DIAN_SIGNER_SUBJECT=800197268   # texto del sujeto del certificado de la DIAN
+# Solo para pruebas y sin bundle: registra facturas recibidas SIN verificar su firma
 # INBOUND_ALLOW_UNVERIFIED_SIGNATURES=false
 ```
 
@@ -216,13 +221,18 @@ Para registrar las facturas que te emiten tus proveedores y habilitar el RADIAN,
 }
 ```
 
-> **Estado: deshabilitado por defecto (`501 Not Implemented`).** La verificación criptográfica de la firma del `AttachedDocument` todavía no está implementada; sin ella no es posible distinguir una factura legítima de una fabricada. Para pruebas se puede habilitar con `INBOUND_ALLOW_UNVERIFIED_SIGNATURES=true`: los documentos quedan marcados como no verificados (`signature_verified: false`) y **no admiten eventos RADIAN**.
+> **Requiere `INBOUND_TRUSTED_CA_PEM`.** Sin bundle de CAs configurado el endpoint responde `501 Not Implemented` (o, solo en pruebas con `INBOUND_ALLOW_UNVERIFIED_SIGNATURES=true`, registra el documento como **no verificado**, sin derecho a eventos RADIAN).
 
-*   **Qué hace Dian_Service internamente (cuando está habilitado):**
+*   **Qué hace Dian_Service internamente (verificación configurada):**
     1.  Descomprime el ZIP en memoria, con un límite de 10 MiB descomprimidos y 20 entradas.
-    2.  Comprueba que el XML contenga una firma (solo presencia, **no** verificación criptográfica).
-    3.  Verifica que la respuesta DIAN embebida tenga un `ResponseCode` de `"02"` (Aceptación DIAN).
-    4.  Inserta el documento como recibido (`direction = inbound`, `issuer_nit` = NIT del emisor). Si esa factura del mismo emisor ya estaba registrada, responde `409 Conflict`; nunca sobrescribe otro documento.
+    2.  Extrae con un parser XML (sin DTD) la factura embebida y el `ApplicationResponse` de la DIAN.
+    3.  Verifica con `xmlsec1` tres firmas: la del `AttachedDocument`, la de la factura y la del `ApplicationResponse`. Cada una debe ser la única firma del documento, cubrirlo completo (`URI=""` + transformación enveloped) y estar emitida por una CA del bundle. Nunca se descargan referencias externas.
+    4.  Exige que el `ApplicationResponse` lo firme la DIAN (el sujeto del certificado debe contener `INBOUND_DIAN_SIGNER_SUBJECT`, por defecto su NIT `800197268`), que su `ResponseCode` sea `02` y que se refiera al CUFE de esa factura.
+    5.  Toma número, CUFE, emisor y adquirente **de la factura verificada** (no del contenedor) y exige que el adquirente sea el tenant autenticado (`403` si no).
+    6.  Inserta el documento como recibido (`direction = inbound`, `issuer_nit` = NIT del emisor, `signature_verified: true`). Si esa factura del mismo emisor ya estaba registrada, responde `409 Conflict`; nunca sobrescribe otro documento.
+
+*   Una firma inválida, no confiable o inconsistente responde `422` con el motivo.
+*   **Pendiente de confirmar con documentos reales de la DIAN:** el texto que identifica el certificado de la DIAN en su `ApplicationResponse` y el bundle exacto de CAs acreditadas ante la ONAC. La validez del certificado se evalúa en el momento de la verificación (no en la fecha de firma).
 
 ---
 
@@ -230,7 +240,7 @@ Para registrar las facturas que te emiten tus proveedores y habilitar el RADIAN,
 
 Una vez ingresada la factura del proveedor (inbound), puedes formalizar eventos legales ante el RADIAN para su circulación.
 
-> Solo se admiten eventos sobre facturas recibidas cuya firma fue verificada. Mientras la verificación no esté implementada (ver sección C), este endpoint responde `422` para todas las facturas recibidas.
+> Solo se admiten eventos sobre facturas recibidas cuya firma fue verificada (sección C); sobre las registradas sin verificar responde `422`.
 
 *   **Endpoint:** `POST /api/v1/documents/:id/events`
 *   **Payload JSON:**

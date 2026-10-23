@@ -1,10 +1,11 @@
 use api_server::config::{optional_env, parsed_env, required_env, ApiConfig};
 use api_server::state::AppState;
 use api_server::telemetry::init_telemetry;
-use application::inbound::InboundService;
+use application::inbound::{InboundService, InboundVerification};
 use application::issue::IssueService;
 use application::radian::RadianService;
 use crypto_signer::signer::{SignerConfig, TenantSigner};
+use crypto_signer::verify::XmlSignatureVerifier;
 use dian_soap_client::client::DianSoapClientImpl;
 use infra_postgres::PgStore;
 use sqlx::postgres::PgPoolOptions;
@@ -21,7 +22,21 @@ async fn main() {
     let config = ApiConfig::from_env().unwrap_or_else(|e| exit_with(&e));
     let signer_config = SignerConfig::from_env().unwrap_or_else(|e| exit_with(&e.to_string()));
     let max_connections: u32 = parsed_env("DATABASE_MAX_CONNECTIONS", 10).unwrap_or_else(|e| exit_with(&e));
-    if config.inbound_allow_unverified_signatures {
+    // Verificación de facturas recibidas: requiere xmlsec1 y el bundle de CAs (se comprueba al arrancar).
+    let inbound_verification = config.inbound_trusted_ca_pem.as_ref().map(|ca| {
+        let mut verifier = XmlSignatureVerifier::new(ca);
+        if let Some(intermediates) = &config.inbound_intermediates_pem {
+            verifier = verifier.with_intermediates(intermediates);
+        }
+        verifier
+            .check_ready()
+            .unwrap_or_else(|e| exit_with(&format!("Inbound signature verification: {}", e)));
+        InboundVerification {
+            verifier: Arc::new(verifier),
+            dian_signer_subject: config.inbound_dian_signer_subject.clone(),
+        }
+    });
+    if inbound_verification.is_none() && config.inbound_allow_unverified_signatures {
         tracing::warn!("INBOUND_ALLOW_UNVERIFIED_SIGNATURES=true: facturas recibidas sin verificacion criptografica");
     }
 
@@ -47,7 +62,7 @@ async fn main() {
         documents: store.clone(),
         health: store.clone(),
         issue: IssueService::new(store.clone(), config.transmit_max_attempts),
-        inbound: InboundService::new(store.clone()),
+        inbound: InboundService::new(store.clone(), inbound_verification),
         radian: RadianService::new(store.clone(), signer, soap),
         config,
     });

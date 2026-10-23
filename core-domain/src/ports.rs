@@ -239,6 +239,21 @@ pub trait CryptoSigner: Send + Sync {
     async fn sign_soap_for_tenant(&self, tenant_id: Uuid, envelope: &str) -> Result<String, DomainError>;
 }
 
+/// Resultado de una verificación de firma exitosa.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignature {
+    /// Sujeto (RFC 4514) del certificado firmante.
+    pub signer_subject: String,
+}
+
+#[async_trait]
+pub trait SignatureVerifier: Send + Sync {
+    /// Verifica criptográficamente la firma XML-DSig/XAdES envolvente del documento (que debe
+    /// cubrirlo completo) y la cadena de confianza de su certificado. Una firma inválida o no
+    /// confiable es `DomainError::Validation`.
+    async fn verify(&self, xml: &str) -> Result<VerifiedSignature, DomainError>;
+}
+
 /// Marcador que el cliente SOAP coloca dentro de `wsse:Security` para que el firmador
 /// inserte allí el Timestamp, el certificado y la firma.
 pub const WSSE_SECURITY_PLACEHOLDER: &str = "<!-- WSSE_SECURITY -->";
