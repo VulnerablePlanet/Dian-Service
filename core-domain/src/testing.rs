@@ -4,6 +4,7 @@
 //! Reproduce la semántica del adaptador PostgreSQL: un único `Mutex` hace de transacción, de
 //! modo que cada operación del puerto es atómica.
 
+use crate::admin::{ApiKeyRecord, AuditEntry, DeadDelivery, DeadJob, NewTenant};
 use crate::jobs::{Job, NewJob};
 use crate::models::{
     Certificate, CertificateStatus, DianEvent, Direction, Document, DocumentStatus, JobKind,
@@ -11,7 +12,7 @@ use crate::models::{
 };
 use crate::numbering::next_number;
 use crate::ports::{
-    CertificateRepository, DocumentRepository, DomainError, HealthProbe, IssueOutcome,
+    AdminRepository, CertificateRepository, DocumentRepository, DomainError, HealthProbe, IssueOutcome,
     IssuedDocument, JobOutcome, JobRepository, NewInboundDocument, NewOutboundDocument,
     TenantRepository, Transition, WebhookDelivery, WebhookRepository,
 };
@@ -68,6 +69,8 @@ struct State {
     idempotency: HashMap<(Uuid, String), (String, IssuedDocument)>,
     webhooks: Vec<Webhook>,
     deliveries: HashMap<Uuid, StoredDelivery>,
+    api_keys: Vec<ApiKeyRecord>,
+    audit: Vec<AuditEntry>,
 }
 
 impl State {
@@ -116,9 +119,43 @@ pub struct InMemoryStore {
     state: Mutex<State>,
 }
 
+fn api_key_record(tenant_id: Uuid, name: &str, key_hash: String) -> ApiKeyRecord {
+    ApiKeyRecord {
+        id: Uuid::new_v4(),
+        tenant_id,
+        name: name.to_string(),
+        prefix: "legacy".to_string(),
+        key_hash,
+        created_at: Utc::now(),
+        revoked_at: None,
+    }
+}
+
 impl InMemoryStore {
+    /// Registra el tenant. Por comodidad en las pruebas, un `api_keys.secret` se registra
+    /// como API key del tenant.
     pub fn add_tenant(&self, tenant: Tenant) {
-        self.state.lock().unwrap().tenants.push(tenant);
+        let mut state = self.state.lock().unwrap();
+        if let Some(secret) = tenant.api_keys.get("secret").and_then(|v| v.as_str()) {
+            state.api_keys.push(api_key_record(tenant.id, "test", crate::api_keys::hash(secret)));
+        }
+        state.tenants.push(tenant);
+    }
+
+    /// Bitácora administrativa registrada.
+    pub fn audit_log(&self) -> Vec<AuditEntry> {
+        self.state.lock().unwrap().audit.clone()
+    }
+
+    pub fn certificates_of(&self, tenant_id: Uuid) -> Vec<Certificate> {
+        self.state
+            .lock()
+            .unwrap()
+            .certificates
+            .iter()
+            .filter(|c| c.tenant_id == tenant_id)
+            .cloned()
+            .collect()
     }
 
     pub fn add_certificate(&self, certificate: Certificate) {
@@ -200,15 +237,12 @@ impl InMemoryStore {
 
 #[async_trait]
 impl TenantRepository for InMemoryStore {
-    async fn find_by_api_key(&self, api_key: &str) -> Result<Option<Tenant>, DomainError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .tenants
-            .iter()
-            .find(|t| t.api_keys.get("secret").and_then(|v| v.as_str()) == Some(api_key))
-            .cloned())
+    async fn find_by_api_key_hash(&self, key_hash: &str) -> Result<Option<Tenant>, DomainError> {
+        let state = self.state.lock().unwrap();
+        let Some(key) = state.api_keys.iter().find(|k| k.key_hash == key_hash && k.revoked_at.is_none()) else {
+            return Ok(None);
+        };
+        Ok(state.tenants.iter().find(|t| t.id == key.tenant_id).cloned())
     }
 }
 
@@ -682,6 +716,188 @@ impl WebhookRepository for InMemoryStore {
         delivery.last_error = Some(error.to_string());
         delivery.last_status_code = status_code;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl AdminRepository for InMemoryStore {
+    async fn create_tenant(&self, tenant: NewTenant, audit: &AuditEntry) -> Result<Tenant, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        if state.tenants.iter().any(|t| t.tax_id == tenant.tax_id) {
+            return Err(DomainError::Conflict(format!("Ya existe un tenant con NIT {}", tenant.tax_id)));
+        }
+        let created = Tenant {
+            id: tenant.id,
+            tax_id: tenant.tax_id,
+            registration_name: tenant.registration_name,
+            tax_regime: tenant.tax_regime,
+            address_info: serde_json::json!({}),
+            reception_email: tenant.reception_email,
+            api_keys: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.tenants.push(created.clone());
+        state.audit.push(audit.clone());
+        Ok(created)
+    }
+
+    async fn find_tenant(&self, tenant_id: Uuid) -> Result<Option<Tenant>, DomainError> {
+        Ok(self.state.lock().unwrap().tenants.iter().find(|t| t.id == tenant_id).cloned())
+    }
+
+    async fn create_api_key(&self, key: ApiKeyRecord, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        state.api_keys.push(key);
+        state.audit.push(audit.clone());
+        Ok(())
+    }
+
+    async fn list_api_keys(&self, tenant_id: Uuid) -> Result<Vec<ApiKeyRecord>, DomainError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .api_keys
+            .iter()
+            .filter(|k| k.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_api_key(&self, tenant_id: Uuid, key_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(key) = state
+            .api_keys
+            .iter_mut()
+            .find(|k| k.id == key_id && k.tenant_id == tenant_id && k.revoked_at.is_none())
+        else {
+            return Ok(false);
+        };
+        key.revoked_at = Some(Utc::now());
+        state.audit.push(audit.clone());
+        Ok(true)
+    }
+
+    async fn activate_certificate(&self, certificate: Certificate, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        for existing in state.certificates.iter_mut() {
+            if existing.tenant_id == certificate.tenant_id && existing.status == CertificateStatus::Active {
+                existing.status = CertificateStatus::Revoked;
+            }
+        }
+        state.certificates.push(certificate);
+        state.audit.push(audit.clone());
+        Ok(())
+    }
+
+    async fn add_numbering_range(&self, range: NumberingRange, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let overlaps = state.ranges.values().any(|r| {
+            r.tenant_id == range.tenant_id
+                && r.document_type == range.document_type
+                && r.prefix == range.prefix
+                && r.valid_date_from < range.valid_date_to
+                && range.valid_date_from < r.valid_date_to
+        });
+        if overlaps {
+            return Err(DomainError::Conflict(
+                "El rango se solapa en vigencia con otro del mismo tipo y prefijo".to_string(),
+            ));
+        }
+        state.ranges.insert(range.id, range);
+        state.audit.push(audit.clone());
+        Ok(())
+    }
+
+    async fn list_dead_jobs(&self, limit: i64) -> Result<Vec<DeadJob>, DomainError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .jobs
+            .values()
+            .filter(|j| j.status == JobStatus::Dead)
+            .take(limit.max(0) as usize)
+            .map(|j| DeadJob {
+                id: j.id,
+                kind: j.kind,
+                document_id: j.document_id,
+                tenant_id: state.documents.get(&j.document_id).map(|d| d.tenant_id).unwrap_or_default(),
+                attempts: j.attempts,
+                last_error: j.last_error.clone(),
+                failed_at: j.run_at,
+            })
+            .collect())
+    }
+
+    async fn retry_dead_job(&self, job_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(job) = state.jobs.get(&job_id).filter(|j| j.status == JobStatus::Dead).cloned() else {
+            return Ok(false);
+        };
+        let status = state
+            .documents
+            .get(&job.document_id)
+            .ok_or_else(|| DomainError::NotFound(format!("document {}", job.document_id)))?
+            .status;
+        let allowed = match job.kind {
+            JobKind::Transmit => matches!(status, DocumentStatus::Pending | DocumentStatus::ContingencyPending),
+            JobKind::PollStatus => status == DocumentStatus::SentDian,
+        };
+        if !allowed {
+            return Err(DomainError::Conflict(format!(
+                "El documento esta en estado {}: el trabajo {} ya no aplica",
+                status, job.kind
+            )));
+        }
+        if state.has_active_job(job.document_id, job.kind) {
+            return Err(DomainError::Conflict("El documento ya tiene un trabajo activo".to_string()));
+        }
+        state.documents.get_mut(&job.document_id).unwrap().status =
+            if job.kind == JobKind::Transmit { DocumentStatus::Pending } else { status };
+        let stored = state.jobs.get_mut(&job_id).unwrap();
+        stored.status = JobStatus::Queued;
+        stored.attempts = 0;
+        stored.run_at = Utc::now();
+        stored.locked_until = None;
+        state.audit.push(audit.clone());
+        Ok(true)
+    }
+
+    async fn list_dead_deliveries(&self, limit: i64) -> Result<Vec<DeadDelivery>, DomainError> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .deliveries
+            .values()
+            .filter(|d| d.status == "dead")
+            .take(limit.max(0) as usize)
+            .map(|d| DeadDelivery {
+                id: d.id,
+                tenant_id: state
+                    .webhooks
+                    .iter()
+                    .find(|w| w.id == d.webhook_id)
+                    .map(|w| w.tenant_id)
+                    .unwrap_or_default(),
+                webhook_id: d.webhook_id,
+                event_type: d.event_type.clone(),
+                attempts: d.attempts,
+                last_error: d.last_error.clone(),
+                last_status_code: d.last_status_code.map(i32::from),
+                failed_at: d.run_at,
+            })
+            .collect())
+    }
+
+    async fn retry_dead_delivery(&self, delivery_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(delivery) = state.deliveries.get_mut(&delivery_id).filter(|d| d.status == "dead") else {
+            return Ok(false);
+        };
+        delivery.status = "queued";
+        delivery.attempts = 0;
+        delivery.run_at = Utc::now();
+        state.audit.push(audit.clone());
+        Ok(true)
     }
 }
 

@@ -24,7 +24,7 @@ pub async fn auth_middleware(
 
     let tenant = state
         .tenants
-        .find_by_api_key(&token)
+        .find_by_api_key_hash(&core_domain::api_keys::hash(&token))
         .await?
         .ok_or_else(|| ApiError::Unauthorized("Unauthorized: Invalid API Key".to_string()))?;
 

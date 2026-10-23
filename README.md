@@ -53,13 +53,14 @@ for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP
 *   `20261023000000_jobs_and_idempotency.sql` crea la cola de trabajos (`jobs`) y las claves de idempotencia (`idempotency_keys`), y asocia cada documento a su resolución de numeración. Si actualizas desde la versión con Redis, encola automáticamente los documentos que estaban en curso.
 *   `20261024000000_dead_jobs_index.sql` indexa la cola de errores (trabajos `dead`) para las métricas y la administración.
 *   `20261025000000_webhook_deliveries.sql` crea la cola de entregas de webhooks (`webhook_deliveries`) y restringe los tipos de evento suscribibles.
+*   `20261026000000_api_keys_and_admin.sql` crea `api_keys` (solo el SHA-256 de cada clave) y migra las claves heredadas de `tenants.api_keys` (una clave compartida por varios tenants **no se migra**: esos tenants necesitan una clave nueva) y borra los secretos en claro; deja un único certificado activo por tenant (el de vencimiento más lejano) y crea la bitácora `admin_audit_log`.
 
 ### Paso 2 (producción): llave de firma del tenant en Vault Transit
 La política del token debe permitir `read` en `<kv>/data/<ruta del tenant>` y `update` en `<transit>/sign/<llave del tenant>`; nada más. Para cada tenant:
 
 1. Importa su llave RSA (la del certificado ONAC) como llave no exportable: `vault write transit/keys/<llave>/import type=rsa-2048 ciphertext=...` (BYOK, ver la documentación de Vault sobre *Transit key import*), o genera la llave en Transit y solicita el certificado a partir de ella.
 2. Guarda el certificado y el nombre de la llave: `vault kv put secret/tenants/<tenant> certificate=@cert.pem transit_key=<llave>`.
-3. Registra la fila en `certificates` con `vault_reference_path = 'tenants/<tenant>'`.
+3. Registra el certificado con `POST /admin/v1/tenants/:id/certificates` (`vault_reference_path = 'tenants/<tenant>'`); ver la sección H.
 
 ### Paso 3: Configurar las Variables de Entorno
 Los binarios leen la configuración del **entorno del proceso** (no cargan un archivo `.env` por sí mismos; usa tu orquestador, `env $(cat .env | xargs) cargo run ...` o similar). Las variables obligatorias no tienen valor por defecto: si falta alguna, el proceso termina al arrancar con un mensaje explícito.
@@ -91,6 +92,7 @@ VAULT_TOKEN=...
 PORT=8080
 RUST_LOG=info
 LOG_FORMAT=json                          # json (por defecto) o text
+# ADMIN_TOKEN_SHA256=<sha256 hex del token de administración>   # habilita /admin/v1 (api-server)
 METRICS_ADDR=0.0.0.0:9090                # métricas (api-server: 9090, worker: 9091); off las desactiva
 DATABASE_MAX_CONNECTIONS=10
 # Worker
@@ -135,9 +137,11 @@ El proyecto se divide en dos binarios independientes:
 
 ## 4. Guía de Integración para Desarrolladores (Cómo usar la API)
 
-Toda interacción con `Dian_Service` está protegida por un middleware multi-tenant. Debes registrar primero tu Tenant y configurar la cabecera HTTP en cada request:
+Toda interacción con `Dian_Service` está protegida por un middleware multi-tenant. El operador registra el tenant y le emite una API key (sección H); el ERP la envía en cada request:
 
-`Authorization: Bearer <TU_API_KEY_REGISTRADA>`
+`Authorization: Bearer dsk_<64 caracteres hexadecimales>`
+
+El servicio solo guarda el SHA-256 de cada clave: no se puede recuperar, solo revocar y emitir otra.
 
 ---
 
@@ -367,6 +371,26 @@ Registra transacciones de compras realizadas a sujetos no obligados a facturar.
     *   Worker: `dian_worker_webhook_deliveries_total{outcome}` (`delivered`, `retried`, `dead`), `dian_worker_jobs_total{kind,outcome}` (`handled`, `error`, `timeout`), `dian_worker_job_duration_seconds{kind}`, `dian_worker_jobs_in_flight`, `dian_worker_queue_jobs{state}` (`ready`, `scheduled`, `running`, `dead`) y `dian_worker_dian_breaker_open{environment}`.
     *   Alertas sugeridas: `dian_worker_queue_jobs{state="dead"} > 0` (documentos en contingencia que requieren intervención), `dian_worker_queue_jobs{state="ready"}` creciendo sostenidamente (backlog), `dian_worker_dian_breaker_open == 1` durante más de unos minutos, y tasa de `5xx` en la API.
 *   **Logs:** una línea JSON por evento (`LOG_FORMAT=text` para formato legible; nivel con `RUST_LOG`). Cada petición HTTP registra método, ruta, estado, latencia, `request_id` y `tenant_id`; la cabecera `x-request-id` del cliente se propaga (o se genera) y se devuelve en la respuesta. Cada trabajo del worker registra `job_id`, `document_id`, `kind` y `attempt`.
+
+---
+
+### H. Administración de la plataforma (operador)
+
+Rutas bajo `/admin/v1`, autenticadas con `Authorization: Bearer <token de administración>`. El servicio solo conoce el SHA-256 del token: configúralo con `ADMIN_TOKEN_SHA256=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)`. Sin esa variable las rutas no existen (`404`). No expongas `/admin` a Internet. Cada acción que modifica datos queda en `admin_audit_log` en la misma transacción (sin claves ni secretos) y en los logs con `target=admin_audit`.
+
+| Método y ruta | Uso |
+|---|---|
+| `POST /admin/v1/tenants` | Alta de tenant: `{ "tax_id": "901234567", "registration_name", "tax_regime", "reception_email" }` (`409` si el NIT existe) |
+| `GET /admin/v1/tenants/:id` | Consulta |
+| `POST /admin/v1/tenants/:id/api-keys` | Emite una API key `{ "name": "ERP" }`; la clave se muestra **solo** en esta respuesta |
+| `GET /admin/v1/tenants/:id/api-keys` | Lista claves (nombre, prefijo visible, fechas; nunca la clave ni su hash) |
+| `DELETE /admin/v1/tenants/:id/api-keys/:key_id` | Revoca una clave (efecto inmediato) |
+| `POST /admin/v1/tenants/:id/certificates` | `{ "vault_reference_path", "thumbprint", "expiration_date" }`: pasa a ser el certificado activo y revoca el anterior |
+| `POST /admin/v1/tenants/:id/numbering-ranges` | `{ "document_type", "prefix", "from_number", "to_number", "technical_key", "valid_date_from", "valid_date_to", "last_issued_number"? }`; `409` si se solapa en vigencia con otro rango del mismo tipo y prefijo; la clave técnica no se devuelve |
+| `GET /admin/v1/jobs/dead?limit=50` | Cola de errores: trabajos que agotaron sus intentos |
+| `POST /admin/v1/jobs/:id/retry` | Reencola el trabajo con intentos a cero (`409` si el documento ya no lo admite, p. ej. ya aceptado) |
+| `GET /admin/v1/webhook-deliveries/dead?limit=50` | Entregas de webhooks agotadas |
+| `POST /admin/v1/webhook-deliveries/:id/retry` | Reencola la entrega |
 
 ---
 

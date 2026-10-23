@@ -9,8 +9,10 @@ use core_domain::jobs::NewJob;
 use core_domain::models::{DianEvent, DocumentStatus, DocumentType, EventStatus, JobKind};
 use core_domain::ports::{
     DocumentRepository, DomainError, IdempotencyKey, IssueOutcome, JobOutcome, JobRepository,
-    NewInboundDocument, NewOutboundDocument, Transition, WebhookRepository,
+    NewInboundDocument, NewOutboundDocument, Transition, WebhookRepository, AdminRepository, TenantRepository,
 };
+use core_domain::admin::{ApiKeyRecord, AuditEntry, NewTenant};
+use core_domain::models::{Certificate, CertificateStatus, NumberingRange};
 use core_domain::models::{Webhook, WebhookSubscriptionStatus};
 use infra_postgres::{PgStore, MIGRATOR};
 use serde_json::json;
@@ -419,6 +421,121 @@ async fn final_transitions_enqueue_webhook_deliveries_atomically() {
 
     assert!(store.delete_webhook(f.tenant_id, accepted_only.id).await.unwrap());
     assert!(!store.delete_webhook(Uuid::new_v4(), accepted_only.id).await.unwrap());
+}
+
+fn entry(action: &'static str) -> AuditEntry {
+    AuditEntry { action, tenant_id: None, subject_id: None, details: json!({ "k": "v" }) }
+}
+
+#[tokio::test]
+async fn admin_operations_are_atomic_with_their_audit_entry() {
+    let Some(f) = fixture().await else { return };
+    let store = f.store.clone();
+    let tenant = store
+        .create_tenant(
+            NewTenant {
+                id: Uuid::new_v4(),
+                tax_id: "901234567".into(),
+                registration_name: "Nuevo SAS".into(),
+                tax_regime: "48".into(),
+                reception_email: "fe@nuevo.co".into(),
+            },
+            &entry("tenant.created"),
+        )
+        .await
+        .unwrap();
+    let duplicate = NewTenant {
+        id: Uuid::new_v4(),
+        tax_id: "901234567".into(),
+        registration_name: "Otro".into(),
+        tax_regime: "48".into(),
+        reception_email: "a@b.co".into(),
+    };
+    assert!(matches!(store.create_tenant(duplicate, &entry("tenant.created")).await, Err(DomainError::Conflict(_))));
+
+    // API keys: búsqueda por hash, revocación.
+    let key = ApiKeyRecord {
+        id: Uuid::new_v4(),
+        tenant_id: tenant.id,
+        name: "ERP".into(),
+        prefix: "dsk_abcdef12".into(),
+        key_hash: core_domain::api_keys::hash("dsk_secret"),
+        created_at: Utc::now(),
+        revoked_at: None,
+    };
+    store.create_api_key(key.clone(), &entry("api_key.created")).await.unwrap();
+    let found = store.find_by_api_key_hash(&core_domain::api_keys::hash("dsk_secret")).await.unwrap();
+    assert_eq!(found.unwrap().id, tenant.id);
+    assert!(store.find_by_api_key_hash(&core_domain::api_keys::hash("k")).await.unwrap().is_none(), "plaintext column is not used");
+    assert!(store.revoke_api_key(tenant.id, key.id, &entry("api_key.revoked")).await.unwrap());
+    assert!(!store.revoke_api_key(tenant.id, key.id, &entry("api_key.revoked")).await.unwrap());
+    assert!(store.find_by_api_key_hash(&key.key_hash).await.unwrap().is_none());
+
+    // Certificados: uno activo.
+    let certificate = |path: &str| Certificate {
+        id: Uuid::new_v4(),
+        tenant_id: tenant.id,
+        vault_reference_path: path.into(),
+        thumbprint: "AB".into(),
+        expiration_date: Utc::now() + ChronoDuration::days(300),
+        status: CertificateStatus::Active,
+    };
+    store.activate_certificate(certificate("t/1"), &entry("certificate.activated")).await.unwrap();
+    store.activate_certificate(certificate("t/2"), &entry("certificate.activated")).await.unwrap();
+    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM certificates WHERE tenant_id = $1 AND status = 'active'")
+        .bind(tenant.id).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(active, 1);
+
+    // Rangos: sin solape de vigencia.
+    let range = |from: i64, to: i64| NumberingRange {
+        id: Uuid::new_v4(),
+        tenant_id: tenant.id,
+        document_type: DocumentType::Invoice,
+        prefix: "FE".into(),
+        from_number: 1,
+        to_number: 100,
+        technical_key: "tk".into(),
+        valid_date_from: Utc::now() + ChronoDuration::days(from),
+        valid_date_to: Utc::now() + ChronoDuration::days(to),
+        current_counter: 0,
+    };
+    store.add_numbering_range(range(-1, 100), &entry("numbering_range.created")).await.unwrap();
+    assert!(matches!(
+        store.add_numbering_range(range(50, 200), &entry("numbering_range.created")).await,
+        Err(DomainError::Conflict(_))
+    ));
+    store.add_numbering_range(range(100, 200), &entry("numbering_range.created")).await.unwrap();
+
+    let audited: Vec<String> = sqlx::query_scalar("SELECT action FROM admin_audit_log ORDER BY created_at, action")
+        .fetch_all(&f.pool).await.unwrap();
+    assert_eq!(audited.len(), 7, "failed and no-op operations leave no audit entry: {:?}", audited);
+}
+
+#[tokio::test]
+async fn dead_jobs_are_listed_and_retried_with_document_guard() {
+    let Some(f) = fixture().await else { return };
+    f.add_range(DocumentType::Invoice, "FE", 1, 1000).await;
+    let store = f.store.clone();
+    let (doc_id, _) = created(f.issue("FE", None).await.unwrap());
+    let job = store.claim("w", 1, Duration::from_secs(600)).await.unwrap().remove(0);
+    store
+        .apply_transition(Transition::new(doc_id, DocumentStatus::ContingencyPending).with_job(JobOutcome::Bury(job.id, "down".into())))
+        .await
+        .unwrap();
+
+    let dead = store.list_dead_jobs(10).await.unwrap();
+    assert_eq!((dead.len(), dead[0].tenant_id, dead[0].kind), (1, f.tenant_id, JobKind::Transmit));
+    assert!(store.retry_dead_job(job.id, &entry("job.retried")).await.unwrap());
+    assert!(!store.retry_dead_job(job.id, &entry("job.retried")).await.unwrap(), "no longer dead");
+    assert_eq!(store.find_document(doc_id).await.unwrap().unwrap().status, DocumentStatus::Pending);
+    let again = store.claim("w", 1, Duration::from_secs(600)).await.unwrap().remove(0);
+    assert_eq!((again.id, again.attempts), (job.id, 1));
+
+    store
+        .apply_transition(Transition::new(doc_id, DocumentStatus::DianAccepted).with_job(JobOutcome::Bury(job.id, "late".into())))
+        .await
+        .unwrap();
+    assert!(matches!(store.retry_dead_job(job.id, &entry("job.retried")).await, Err(DomainError::Conflict(_))));
 }
 
 #[tokio::test]

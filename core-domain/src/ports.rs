@@ -1,5 +1,6 @@
 //! Puertos del dominio: contratos que implementan los adaptadores de infraestructura.
 
+use crate::admin::{ApiKeyRecord, AuditEntry, DeadDelivery, DeadJob, NewTenant};
 use crate::jobs::{Job, NewJob};
 use crate::models::{
     Certificate, DianEvent, Document, DocumentStatus, DocumentType, NumberingRange, Tenant, Webhook,
@@ -56,7 +57,8 @@ pub struct DianResponse {
 
 #[async_trait]
 pub trait TenantRepository: Send + Sync {
-    async fn find_by_api_key(&self, api_key: &str) -> Result<Option<Tenant>, DomainError>;
+    /// Tenant dueño de la API key no revocada cuya huella es `key_hash` (`api_keys::hash`).
+    async fn find_by_api_key_hash(&self, key_hash: &str) -> Result<Option<Tenant>, DomainError>;
 }
 
 #[async_trait]
@@ -264,6 +266,34 @@ pub trait WebhookRepository: Send + Sync {
         status_code: Option<u16>,
     ) -> Result<(), DomainError>;
     async fn bury_delivery(&self, delivery_id: Uuid, error: &str, status_code: Option<u16>) -> Result<(), DomainError>;
+}
+
+/// Operaciones del operador de la plataforma. Cada operación que modifica datos registra su
+/// `AuditEntry` en la misma transacción.
+#[async_trait]
+pub trait AdminRepository: Send + Sync {
+    /// `Conflict` si ya existe un tenant con ese NIT.
+    async fn create_tenant(&self, tenant: NewTenant, audit: &AuditEntry) -> Result<Tenant, DomainError>;
+    async fn find_tenant(&self, tenant_id: Uuid) -> Result<Option<Tenant>, DomainError>;
+
+    async fn create_api_key(&self, key: ApiKeyRecord, audit: &AuditEntry) -> Result<(), DomainError>;
+    async fn list_api_keys(&self, tenant_id: Uuid) -> Result<Vec<ApiKeyRecord>, DomainError>;
+    /// `false` si la clave no existe para el tenant o ya estaba revocada.
+    async fn revoke_api_key(&self, tenant_id: Uuid, key_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError>;
+
+    /// Registra el certificado como el activo del tenant y revoca el anterior.
+    async fn activate_certificate(&self, certificate: Certificate, audit: &AuditEntry) -> Result<(), DomainError>;
+    /// `Conflict` si se solapa en vigencia con otro rango del mismo tipo y prefijo.
+    async fn add_numbering_range(&self, range: NumberingRange, audit: &AuditEntry) -> Result<(), DomainError>;
+
+    async fn list_dead_jobs(&self, limit: i64) -> Result<Vec<DeadJob>, DomainError>;
+    /// Devuelve a la cola un trabajo muerto (intentos a cero). `false` si no está muerto;
+    /// `Conflict` si el estado del documento ya no admite ese trabajo o hay otro activo.
+    async fn retry_dead_job(&self, job_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError>;
+
+    async fn list_dead_deliveries(&self, limit: i64) -> Result<Vec<DeadDelivery>, DomainError>;
+    /// Devuelve a la cola una entrega muerta. `false` si no está muerta.
+    async fn retry_dead_delivery(&self, delivery_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError>;
 }
 
 // ---------------------------------------------------------------------------------------

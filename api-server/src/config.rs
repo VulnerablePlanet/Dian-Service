@@ -19,6 +19,8 @@ pub struct ApiConfig {
     /// Destinos de webhooks admitidos (`WEBHOOK_ALLOW_HTTP`, `WEBHOOK_ALLOW_PRIVATE_NETWORKS`;
     /// solo desarrollo).
     pub webhook_policy: application::webhooks::DestinationPolicy,
+    /// SHA-256 (hex en minúsculas) del token de administración; sin él no hay rutas `/admin`.
+    pub admin_token_sha256: Option<String>,
 }
 
 impl ApiConfig {
@@ -38,6 +40,16 @@ impl ApiConfig {
             webhook_policy: application::webhooks::DestinationPolicy {
                 allow_http: flag_env("WEBHOOK_ALLOW_HTTP"),
                 allow_private_networks: flag_env("WEBHOOK_ALLOW_PRIVATE_NETWORKS"),
+            },
+            admin_token_sha256: match optional_env("ADMIN_TOKEN_SHA256") {
+                None => None,
+                Some(value) => {
+                    let value = value.trim().to_ascii_lowercase();
+                    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Err("ADMIN_TOKEN_SHA256 must be the hex SHA-256 of the admin token".to_string());
+                    }
+                    Some(value)
+                }
             },
         })
     }

@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod config;
 pub mod error;
 pub mod events;
@@ -55,8 +56,11 @@ pub fn router(state: SharedState) -> Router {
 
     let public_routes = Router::new().route("/health", get(health_check));
 
-    Router::new()
-        .nest("/api/v1", api_routes.merge(public_routes))
+    let mut router = Router::new().nest("/api/v1", api_routes.merge(public_routes));
+    if state.config.admin_token_sha256.is_some() {
+        router = router.nest("/admin/v1", admin::routes(state.clone()));
+    }
+    router
         .merge(observability::probe_routes(state.health.clone()))
         .route_layer(from_fn_with_state(state.metrics.clone(), crate::metrics::track))
         .layer(

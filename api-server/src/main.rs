@@ -1,6 +1,7 @@
 use api_server::config::{optional_env, parsed_env, required_env, ApiConfig};
 use api_server::state::AppState;
 use api_server::metrics::HttpMetrics;
+use application::admin::AdminService;
 use application::inbound::{InboundService, InboundVerification};
 use application::issue::IssueService;
 use application::radian::RadianService;
@@ -71,6 +72,7 @@ async fn main() {
         inbound: InboundService::new(store.clone(), inbound_verification),
         radian: RadianService::new(store.clone(), signer, soap),
         webhooks: WebhookService::new(store.clone(), config.webhook_policy),
+        admin: AdminService::new(store.clone()),
         config,
         metrics,
     });

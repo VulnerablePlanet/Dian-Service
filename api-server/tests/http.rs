@@ -3,6 +3,7 @@
 use api_server::config::ApiConfig;
 use api_server::metrics::HttpMetrics;
 use api_server::state::AppState;
+use application::admin::AdminService;
 use application::inbound::InboundService;
 use application::issue::IssueService;
 use application::radian::RadianService;
@@ -134,6 +135,8 @@ fn range(tenant: &Tenant, document_type: DocumentType, prefix: &str) -> Numberin
     }
 }
 
+const ADMIN_TOKEN: &str = "admin-token-for-tests";
+
 fn config() -> ApiConfig {
     ApiConfig {
         dian_hab_url: None,
@@ -144,6 +147,7 @@ fn config() -> ApiConfig {
         inbound_intermediates_pem: None,
         inbound_dian_signer_subject: "800197268".into(),
         webhook_policy: DestinationPolicy::default(),
+        admin_token_sha256: Some(core_domain::api_keys::hash(ADMIN_TOKEN)),
     }
 }
 
@@ -165,6 +169,7 @@ fn app_with_metrics(
         inbound: InboundService::new(documents.clone(), None),
         radian: RadianService::new(documents, Arc::new(NoSigner), Arc::new(NoSoap)),
         webhooks: WebhookService::new(store.clone(), DestinationPolicy::default()),
+        admin: AdminService::new(store.clone()),
         config: config(),
         metrics,
     }))
@@ -387,4 +392,49 @@ async fn tenants_manage_their_webhook_subscriptions() {
     let uri = format!("/api/v1/webhooks/{}", created["id"].as_str().unwrap());
     assert_eq!(send(&app, "DELETE", &uri, None, &[AUTH]).await.0, StatusCode::NO_CONTENT);
     assert_eq!(send(&app, "DELETE", &uri, None, &[AUTH]).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn operators_onboard_tenants_through_the_admin_api() {
+    let (app, store) = app();
+    let admin = ("Authorization", "Bearer admin-token-for-tests");
+
+    let tenant = json!({ "tax_id": "901234567", "registration_name": "Nuevo SAS", "tax_regime": "48", "reception_email": "fe@nuevo.co" });
+    assert_eq!(send(&app, "POST", "/admin/v1/tenants", Some(tenant.clone()), &[]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&app, "POST", "/admin/v1/tenants", Some(tenant.clone()), &[AUTH]).await.0, StatusCode::UNAUTHORIZED, "tenant keys are not admin tokens");
+    let (status, _, created) = send(&app, "POST", "/admin/v1/tenants", Some(tenant.clone()), &[admin]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(send(&app, "POST", "/admin/v1/tenants", Some(tenant), &[admin]).await.0, StatusCode::CONFLICT);
+    let tenant_id = created["id"].as_str().unwrap().to_string();
+
+    let range = json!({
+        "document_type": "invoice", "prefix": "FE", "from_number": 1, "to_number": 100, "technical_key": "tk-secret",
+        "valid_date_from": (Utc::now() - Duration::days(1)).to_rfc3339(), "valid_date_to": (Utc::now() + Duration::days(365)).to_rfc3339()
+    });
+    let (status, _, body) = send(&app, "POST", &format!("/admin/v1/tenants/{}/numbering-ranges", tenant_id), Some(range), &[admin]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(!body.to_string().contains("tk-secret"), "the technical key is not echoed");
+
+    let (status, _, key) = send(&app, "POST", &format!("/admin/v1/tenants/{}/api-keys", tenant_id), Some(json!({ "name": "ERP" })), &[admin]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let bearer = format!("Bearer {}", key["key"].as_str().unwrap());
+    let auth = ("Authorization", bearer.as_str());
+
+    let mut invoice = invoice(1);
+    invoice["company_nit"] = json!("901234567");
+    assert_eq!(send(&app, "POST", "/api/v1/invoices", Some(invoice), &[auth]).await.0, StatusCode::ACCEPTED);
+
+    let (_, _, keys) = send(&app, "GET", &format!("/admin/v1/tenants/{}/api-keys", tenant_id), None, &[admin]).await;
+    assert!(!keys.to_string().contains(key["key"].as_str().unwrap()));
+    let revoke = format!("/admin/v1/tenants/{}/api-keys/{}", tenant_id, key["id"].as_str().unwrap());
+    assert_eq!(send(&app, "DELETE", &revoke, None, &[admin]).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(send(&app, "GET", "/api/v1/webhooks", None, &[auth]).await.0, StatusCode::UNAUTHORIZED);
+
+    let (status, _, dead) = send(&app, "GET", "/admin/v1/jobs/dead?limit=10", None, &[admin]).await;
+    assert_eq!((status, dead["jobs"].as_array().unwrap().len()), (StatusCode::OK, 0));
+    let missing = format!("/admin/v1/jobs/{}/retry", Uuid::new_v4());
+    assert_eq!(send(&app, "POST", &missing, None, &[admin]).await.0, StatusCode::NOT_FOUND);
+
+    let actions: Vec<&str> = store.audit_log().iter().map(|e| e.action).collect();
+    assert_eq!(actions, vec!["tenant.created", "numbering_range.created", "api_key.created", "api_key.revoked"]);
 }

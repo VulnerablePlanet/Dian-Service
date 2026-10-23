@@ -1,4 +1,5 @@
 use crate::config::ApiConfig;
+use application::admin::AdminService;
 use application::inbound::InboundService;
 use application::issue::IssueService;
 use application::radian::RadianService;
@@ -16,6 +17,7 @@ pub struct AppState {
     pub inbound: InboundService,
     pub radian: RadianService,
     pub webhooks: WebhookService,
+    pub admin: AdminService,
     pub config: ApiConfig,
     pub metrics: Arc<crate::metrics::HttpMetrics>,
 }

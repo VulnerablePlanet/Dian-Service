@@ -6,13 +6,14 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use core_domain::admin::{ApiKeyRecord, AuditEntry, DeadDelivery, DeadJob, NewTenant};
 use core_domain::jobs::{Job, NewJob, QueueDepth};
 use core_domain::models::{
-    Certificate, DianEvent, Document, DocumentStatus, NumberingRange, Tenant, Webhook,
+    Certificate, DianEvent, Document, DocumentStatus, JobKind, NumberingRange, Tenant, Webhook,
 };
 use core_domain::numbering::next_number;
 use core_domain::ports::{
-    CertificateRepository, DocumentRepository, DomainError, HealthProbe, IdempotencyKey,
+    AdminRepository, CertificateRepository, DocumentRepository, DomainError, HealthProbe, IdempotencyKey,
     IssueOutcome, IssuedDocument, JobOutcome, JobRepository, NewInboundDocument,
     NewOutboundDocument, TenantRepository, Transition, WebhookDelivery, WebhookRepository,
 };
@@ -234,12 +235,14 @@ impl PgStore {
 
 #[async_trait]
 impl TenantRepository for PgStore {
-    async fn find_by_api_key(&self, api_key: &str) -> Result<Option<Tenant>, DomainError> {
+    async fn find_by_api_key_hash(&self, key_hash: &str) -> Result<Option<Tenant>, DomainError> {
         let row = sqlx::query(
-            "SELECT id, tax_id, registration_name, tax_regime, address_info, reception_email, api_keys, created_at, updated_at
-             FROM tenants WHERE api_keys->>'secret' = $1",
+            "SELECT t.id, t.tax_id, t.registration_name, t.tax_regime, t.address_info, t.reception_email,
+                    t.api_keys, t.created_at, t.updated_at
+             FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE k.key_hash = $1 AND k.revoked_at IS NULL",
         )
-        .bind(api_key)
+        .bind(key_hash)
         .fetch_optional(&self.pool)
         .await
         .map_err(db)?;
@@ -835,6 +838,312 @@ impl WebhookRepository for PgStore {
         .await
         .map_err(db)?;
         Ok(())
+    }
+}
+
+async fn insert_audit(tx: &mut Transaction<'_, Postgres>, audit: &AuditEntry) -> Result<(), DomainError> {
+    sqlx::query(
+        "INSERT INTO admin_audit_log (id, action, tenant_id, subject_id, details) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(audit.action)
+    .bind(audit.tenant_id)
+    .bind(audit.subject_id)
+    .bind(&audit.details)
+    .execute(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+fn conflict_on_unique(e: sqlx::Error, message: &str) -> DomainError {
+    if is_unique_violation(&e) {
+        DomainError::Conflict(message.to_string())
+    } else {
+        db(e)
+    }
+}
+
+fn api_key_from_row(row: &PgRow) -> Result<ApiKeyRecord, DomainError> {
+    Ok(ApiKeyRecord {
+        id: row.try_get("id").map_err(db)?,
+        tenant_id: row.try_get("tenant_id").map_err(db)?,
+        name: row.try_get("name").map_err(db)?,
+        prefix: row.try_get("prefix").map_err(db)?,
+        key_hash: row.try_get("key_hash").map_err(db)?,
+        created_at: row.try_get("created_at").map_err(db)?,
+        revoked_at: row.try_get("revoked_at").map_err(db)?,
+    })
+}
+
+#[async_trait]
+impl AdminRepository for PgStore {
+    async fn create_tenant(&self, tenant: NewTenant, audit: &AuditEntry) -> Result<Tenant, DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let row = sqlx::query(
+            "INSERT INTO tenants (id, tax_id, registration_name, tax_regime, reception_email)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, tax_id, registration_name, tax_regime, address_info, reception_email, api_keys, created_at, updated_at",
+        )
+        .bind(tenant.id)
+        .bind(&tenant.tax_id)
+        .bind(&tenant.registration_name)
+        .bind(&tenant.tax_regime)
+        .bind(&tenant.reception_email)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| conflict_on_unique(e, &format!("Ya existe un tenant con NIT {}", tenant.tax_id)))?;
+        insert_audit(&mut tx, audit).await?;
+        tx.commit().await.map_err(db)?;
+        tenant_from_row(&row)
+    }
+
+    async fn find_tenant(&self, tenant_id: Uuid) -> Result<Option<Tenant>, DomainError> {
+        let row = sqlx::query(
+            "SELECT id, tax_id, registration_name, tax_regime, address_info, reception_email, api_keys, created_at, updated_at
+             FROM tenants WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        row.as_ref().map(tenant_from_row).transpose()
+    }
+
+    async fn create_api_key(&self, key: ApiKeyRecord, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query(
+            "INSERT INTO api_keys (id, tenant_id, name, prefix, key_hash, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(key.id)
+        .bind(key.tenant_id)
+        .bind(&key.name)
+        .bind(&key.prefix)
+        .bind(&key.key_hash)
+        .bind(key.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        insert_audit(&mut tx, audit).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn list_api_keys(&self, tenant_id: Uuid) -> Result<Vec<ApiKeyRecord>, DomainError> {
+        sqlx::query(
+            "SELECT id, tenant_id, name, prefix, key_hash, created_at, revoked_at
+             FROM api_keys WHERE tenant_id = $1 ORDER BY created_at",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?
+        .iter()
+        .map(api_key_from_row)
+        .collect()
+    }
+
+    async fn revoke_api_key(&self, tenant_id: Uuid, key_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let revoked = sqlx::query(
+            "UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected()
+            == 1;
+        if revoked {
+            insert_audit(&mut tx, audit).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(revoked)
+    }
+
+    async fn activate_certificate(&self, certificate: Certificate, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("UPDATE certificates SET status = 'revoked' WHERE tenant_id = $1 AND status = 'active'")
+            .bind(certificate.tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        sqlx::query(
+            "INSERT INTO certificates (id, tenant_id, vault_reference_path, thumbprint, expiration_date, status)
+             VALUES ($1, $2, $3, $4, $5, $6::certificate_status)",
+        )
+        .bind(certificate.id)
+        .bind(certificate.tenant_id)
+        .bind(&certificate.vault_reference_path)
+        .bind(&certificate.thumbprint)
+        .bind(certificate.expiration_date)
+        .bind(certificate.status.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| conflict_on_unique(e, "El tenant ya tiene otro certificado activo"))?;
+        insert_audit(&mut tx, audit).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn add_numbering_range(&self, range: NumberingRange, audit: &AuditEntry) -> Result<(), DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        // Serializa las altas de rangos del mismo tenant para que la comprobación de solape
+        // no compita con otra alta concurrente.
+        sqlx::query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE")
+            .bind(range.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?
+            .ok_or_else(|| DomainError::NotFound(format!("Tenant {} no encontrado", range.tenant_id)))?;
+        let inserted = sqlx::query(
+            "INSERT INTO numbering_ranges (id, tenant_id, document_type, prefix, from_number, to_number, technical_key,
+                                           valid_date_from, valid_date_to, current_counter)
+             SELECT $1, $2, $3::document_type, $4, $5, $6, $7, $8, $9, $10
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM numbering_ranges
+                 WHERE tenant_id = $2 AND document_type = $3::document_type AND prefix = $4
+                   AND valid_date_from < $9 AND $8 < valid_date_to)",
+        )
+        .bind(range.id)
+        .bind(range.tenant_id)
+        .bind(range.document_type.as_str())
+        .bind(&range.prefix)
+        .bind(range.from_number)
+        .bind(range.to_number)
+        .bind(&range.technical_key)
+        .bind(range.valid_date_from)
+        .bind(range.valid_date_to)
+        .bind(range.current_counter)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(DomainError::Conflict(
+                "El rango se solapa en vigencia con otro del mismo tipo y prefijo".to_string(),
+            ));
+        }
+        insert_audit(&mut tx, audit).await?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn list_dead_jobs(&self, limit: i64) -> Result<Vec<DeadJob>, DomainError> {
+        let rows = sqlx::query(
+            "SELECT j.id, j.kind::text AS kind, j.document_id, d.tenant_id, j.attempts, j.last_error, j.updated_at
+             FROM jobs j JOIN documents d ON d.id = j.document_id
+             WHERE j.status = 'dead' ORDER BY j.updated_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                Ok(DeadJob {
+                    id: row.try_get("id").map_err(db)?,
+                    kind: parse(row, "kind")?,
+                    document_id: row.try_get("document_id").map_err(db)?,
+                    tenant_id: row.try_get("tenant_id").map_err(db)?,
+                    attempts: row.try_get("attempts").map_err(db)?,
+                    last_error: row.try_get("last_error").map_err(db)?,
+                    failed_at: row.try_get("updated_at").map_err(db)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn retry_dead_job(&self, job_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let Some(row) = sqlx::query(
+            "SELECT j.kind::text AS kind, j.document_id, d.status::text AS status
+             FROM jobs j JOIN documents d ON d.id = j.document_id
+             WHERE j.id = $1 AND j.status = 'dead'
+             FOR UPDATE OF j, d",
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?
+        else {
+            tx.rollback().await.map_err(db)?;
+            return Ok(false);
+        };
+        let kind: JobKind = parse(&row, "kind")?;
+        let status: DocumentStatus = parse(&row, "status")?;
+        let document_id: Uuid = row.try_get("document_id").map_err(db)?;
+        let allowed = match kind {
+            JobKind::Transmit => matches!(status, DocumentStatus::Pending | DocumentStatus::ContingencyPending),
+            JobKind::PollStatus => status == DocumentStatus::SentDian,
+        };
+        if !allowed {
+            return Err(DomainError::Conflict(format!(
+                "El documento esta en estado {}: el trabajo {} ya no aplica",
+                status, kind
+            )));
+        }
+        if kind == JobKind::Transmit && status == DocumentStatus::ContingencyPending {
+            sqlx::query("UPDATE documents SET status = 'pending' WHERE id = $1")
+                .bind(document_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        sqlx::query(
+            "UPDATE jobs SET status = 'queued', attempts = 0, run_at = now(), locked_until = NULL, locked_by = NULL
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| conflict_on_unique(e, "El documento ya tiene un trabajo activo"))?;
+        insert_audit(&mut tx, audit).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(true)
+    }
+
+    async fn list_dead_deliveries(&self, limit: i64) -> Result<Vec<DeadDelivery>, DomainError> {
+        let rows = sqlx::query(
+            "SELECT d.id, w.tenant_id, d.webhook_id, d.event_type, d.attempts, d.last_error, d.last_status_code, d.updated_at
+             FROM webhook_deliveries d JOIN webhooks w ON w.id = d.webhook_id
+             WHERE d.status = 'dead' ORDER BY d.updated_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                Ok(DeadDelivery {
+                    id: row.try_get("id").map_err(db)?,
+                    tenant_id: row.try_get("tenant_id").map_err(db)?,
+                    webhook_id: row.try_get("webhook_id").map_err(db)?,
+                    event_type: row.try_get("event_type").map_err(db)?,
+                    attempts: row.try_get("attempts").map_err(db)?,
+                    last_error: row.try_get("last_error").map_err(db)?,
+                    last_status_code: row.try_get("last_status_code").map_err(db)?,
+                    failed_at: row.try_get("updated_at").map_err(db)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn retry_dead_delivery(&self, delivery_id: Uuid, audit: &AuditEntry) -> Result<bool, DomainError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let retried = sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'queued', attempts = 0, run_at = now(), locked_until = NULL
+             WHERE id = $1 AND status = 'dead'",
+        )
+        .bind(delivery_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected()
+            == 1;
+        if retried {
+            insert_audit(&mut tx, audit).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(retried)
     }
 }
 
