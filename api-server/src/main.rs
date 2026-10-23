@@ -35,8 +35,9 @@ async fn main() {
 
     let signer = Arc::new(TenantSigner::new(signer_config, store.clone()));
     tracing::info!(signing_mode = ?signer.mode(), "Firma configurada");
+    // Los envelopes SOAP se firman (WS-Security) con el certificado del tenant.
     let soap = Arc::new(DianSoapClientImpl::new(
-        config.dian_binary_security_token.clone(),
+        signer.clone(),
         config.dian_hab_url.clone(),
         config.dian_prod_url.clone(),
     ));

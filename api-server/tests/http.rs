@@ -29,28 +29,31 @@ impl CryptoSigner for NoSigner {
     async fn sign_for_tenant(&self, _tenant_id: Uuid, _xml: &str) -> Result<String, DomainError> {
         Err(DomainError::Crypto("not used in HTTP tests".into()))
     }
+    async fn sign_soap_for_tenant(&self, _tenant_id: Uuid, _envelope: &str) -> Result<String, DomainError> {
+        Err(DomainError::Crypto("not used in HTTP tests".into()))
+    }
 }
 
 struct NoSoap;
 
 #[async_trait]
 impl DianSoapClient for NoSoap {
-    async fn send_bill_sync(&self, _: &[u8], _: bool) -> Result<DianResponse, DomainError> {
+    async fn send_bill_sync(&self, _: Uuid, _: &[u8], _: bool) -> Result<DianResponse, DomainError> {
         unreachable!()
     }
-    async fn send_bill_async(&self, _: &[u8], _: bool) -> Result<String, DomainError> {
+    async fn send_bill_async(&self, _: Uuid, _: &[u8], _: bool) -> Result<String, DomainError> {
         unreachable!()
     }
-    async fn send_test_set_async(&self, _: &[u8], _: &str, _: bool) -> Result<String, DomainError> {
+    async fn send_test_set_async(&self, _: Uuid, _: &[u8], _: &str, _: bool) -> Result<String, DomainError> {
         unreachable!()
     }
-    async fn get_status(&self, _: &str, _: bool) -> Result<DianResponse, DomainError> {
+    async fn get_status(&self, _: Uuid, _: &str, _: bool) -> Result<DianResponse, DomainError> {
         unreachable!()
     }
-    async fn get_status_zip(&self, _: &str, _: bool) -> Result<DianResponse, DomainError> {
+    async fn get_status_zip(&self, _: Uuid, _: &str, _: bool) -> Result<DianResponse, DomainError> {
         unreachable!()
     }
-    async fn send_event_update_status(&self, _: &[u8], _: bool) -> Result<DianResponse, DomainError> {
+    async fn send_event_update_status(&self, _: Uuid, _: &[u8], _: bool) -> Result<DianResponse, DomainError> {
         unreachable!()
     }
 }
@@ -131,7 +134,6 @@ fn range(tenant: &Tenant, document_type: DocumentType, prefix: &str) -> Numberin
 
 fn config() -> ApiConfig {
     ApiConfig {
-        dian_binary_security_token: "token".into(),
         dian_hab_url: None,
         dian_prod_url: None,
         inbound_allow_unverified_signatures: false,

@@ -169,7 +169,7 @@ impl DocumentProcessor {
         // Si un intento anterior pudo haber llegado a la DIAN (p. ej. timeout tras el envío),
         // se consulta el estado antes de reenviar para no duplicar la transmisión.
         if job.attempts > 1 && test_set_id(&document).is_none() {
-            if let Ok(status) = self.soap.get_status(&artifacts.cufe, is_hab).await {
+            if let Ok(status) = self.soap.get_status(document.tenant_id, &artifacts.cufe, is_hab).await {
                 if ACCEPTED_CODES.contains(&status.status_code.as_str()) {
                     breaker.record_success().await;
                     info!(document_id = %document.id, "already accepted by DIAN; not resending");
@@ -196,7 +196,7 @@ impl DocumentProcessor {
         };
 
         if let Some(test_set_id) = test_set_id(&document) {
-            return match self.soap.send_test_set_async(&zip, &test_set_id, is_hab).await {
+            return match self.soap.send_test_set_async(document.tenant_id, &zip, &test_set_id, is_hab).await {
                 Ok(zip_key) => {
                     breaker.record_success().await;
                     let first_poll = Utc::now()
@@ -223,7 +223,7 @@ impl DocumentProcessor {
             };
         }
 
-        match self.soap.send_bill_sync(&zip, is_hab).await {
+        match self.soap.send_bill_sync(document.tenant_id, &zip, is_hab).await {
             Ok(response) => {
                 breaker.record_success().await;
                 let accepted = ACCEPTED_CODES.contains(&response.status_code.as_str());
@@ -279,7 +279,6 @@ impl DocumentProcessor {
             }
             DocumentType::Payroll => payload_with_number::<PayrollPayload>(document)?.employer_nit,
             DocumentType::SupportDocument => payload_with_number::<SupportDocumentPayload>(document)?.buyer_nit,
-            other => return Err(format!("Document type {} is not supported yet", other)),
         };
 
         if let Some(signed_xml) = document.signed_xml.clone().filter(|_| !document.cufe_cude.is_empty()) {
@@ -324,7 +323,6 @@ impl DocumentProcessor {
                 .map_err(|e| format!("Payroll generation failed: {}", e)),
             DocumentType::SupportDocument => ubl_engine::generate_support_document_xml(&payload_with_number(document)?)
                 .map_err(|e| format!("Support document generation failed: {}", e)),
-            other => Err(format!("Document type {} is not supported yet", other)),
         }
     }
 
@@ -398,7 +396,7 @@ impl DocumentProcessor {
             return self.jobs.release(job.id, run_at).await;
         }
 
-        let outcome = match self.soap.get_status_zip(&zip_key, is_hab).await {
+        let outcome = match self.soap.get_status_zip(document.tenant_id, &zip_key, is_hab).await {
             Ok(response) => {
                 breaker.record_success().await;
                 let code = response.status_code.clone();
@@ -539,6 +537,7 @@ mod tests {
         let (_, expected_cufe) = ubl_engine::generate_invoice_xml(&invoice_payload(1), "tk-from-range").unwrap();
         assert_eq!(doc.cufe_cude, expected_cufe, "CUFE must use the resolution's technical key");
         assert!(h.soap.last_xml().contains("<ds:SignatureValue>fake</ds:SignatureValue>"));
+        assert_eq!(*h.soap.last_tenant.lock().unwrap(), Some(h.tenant.id), "SOAP identity is the issuing tenant");
         assert_eq!(h.store.events_for(id)[0].event_status, EventStatus::Accepted);
         assert_eq!(h.store.jobs_for(id)[0].status, JobStatus::Done);
     }

@@ -12,3 +12,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 zip = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

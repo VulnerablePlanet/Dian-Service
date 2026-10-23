@@ -1,4 +1,4 @@
-use chrono::Utc;
+use core_domain::ports::WSSE_SECURITY_PLACEHOLDER;
 
 /// Escapa texto para insertarlo como contenido de un elemento XML.
 pub fn xml_escape(value: &str) -> String {
@@ -16,21 +16,28 @@ pub fn xml_escape(value: &str) -> String {
     out
 }
 
-/// Construye un SOAP Envelope v1.2 con WS-Security (BinarySecurityToken, Timestamp) y WS-Addressing.
-pub fn build_soap_envelope(
-    action: &str,
-    to_url: &str,
-    binary_security_token: &str,
-    body_content: &str,
-) -> String {
-    let now = Utc::now();
-    let created = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    // Ventana de expiración estándar de 10 minutos
-    let expires = (now + chrono::Duration::minutes(10)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+/// Identificador `wsu:Id` de `wsa:To`: el firmador cubre con la firma WS-Security todo
+/// elemento que lleve `wsu:Id`.
+pub const TO_ID: &str = "id-To";
 
+/// Construye un SOAP Envelope v1.2 con WS-Addressing y una cabecera `wsse:Security` vacía
+/// (con [`WSSE_SECURITY_PLACEHOLDER`]) que el firmador completa con el Timestamp, el
+/// certificado del tenant y la firma.
+pub fn build_soap_envelope(action: &str, to_url: &str, body_content: &str) -> String {
     format!(
-        r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" xmlns:wcf="http://wcf.dian.colombia" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><soap:Header><wsa:Action>{}</wsa:Action><wsa:To>{}</wsa:To><wsse:Security><wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created><wsu:Expires>{}</wsu:Expires></wsu:Timestamp><wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3" wsu:Id="X509-Token">{}</wsse:BinarySecurityToken></wsse:Security></soap:Header><soap:Body>{}</soap:Body></soap:Envelope>"#,
-        xml_escape(action), xml_escape(to_url), created, expires, xml_escape(binary_security_token), body_content
+        concat!(
+            r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" "#,
+            r#"xmlns:wcf="http://wcf.dian.colombia" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" "#,
+            r#"xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">"#,
+            r#"<soap:Header><wsse:Security soap:mustUnderstand="true">{security}</wsse:Security>"#,
+            r#"<wsa:Action>{action}</wsa:Action><wsa:To wsu:Id="{to_id}">{to}</wsa:To></soap:Header>"#,
+            r#"<soap:Body>{body}</soap:Body></soap:Envelope>"#
+        ),
+        security = WSSE_SECURITY_PLACEHOLDER,
+        action = xml_escape(action),
+        to_id = TO_ID,
+        to = xml_escape(to_url),
+        body = body_content,
     )
 }
 
@@ -43,14 +50,13 @@ mod tests {
         let envelope = build_soap_envelope(
             "http://wcf.dian.colombia/IWcfDianCustomerServices/SendBillSync",
             "https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc",
-            "cert_b64_dummy",
             "<wcf:SendBillSync><wcf:fileName>test.zip</wcf:fileName></wcf:SendBillSync>",
         );
 
         assert!(envelope.contains("<soap:Envelope"));
         assert!(envelope.contains("<wsa:Action>http://wcf.dian.colombia/IWcfDianCustomerServices/SendBillSync</wsa:Action>"));
-        assert!(envelope.contains("<wsse:BinarySecurityToken"));
-        assert!(envelope.contains("cert_b64_dummy"));
+        assert!(envelope.contains(r#"<wsa:To wsu:Id="id-To">https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc</wsa:To>"#));
+        assert!(envelope.contains(&format!("<wsse:Security soap:mustUnderstand=\"true\">{}</wsse:Security>", WSSE_SECURITY_PLACEHOLDER)));
         assert!(envelope.contains("<soap:Body><wcf:SendBillSync>"));
     }
 

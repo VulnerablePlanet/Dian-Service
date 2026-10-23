@@ -119,7 +119,7 @@ impl RadianService {
             .map_err(|e| DomainError::Internal(e.to_string()))?;
         let response = self
             .soap
-            .send_event_update_status(&zip, request.environment == "2")
+            .send_event_update_status(tenant.id, &zip, request.environment == "2")
             .await?;
 
         let accepted = response.status_code == "00";

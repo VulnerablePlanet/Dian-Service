@@ -24,7 +24,6 @@ use tracing_subscriber::EnvFilter;
 struct WorkerConfig {
     database_url: String,
     database_max_connections: u32,
-    binary_security_token: String,
     dian_hab_url: Option<String>,
     dian_prod_url: Option<String>,
     worker_id: String,
@@ -70,7 +69,6 @@ impl WorkerConfig {
         Ok(Self {
             database_url: required_env("DATABASE_URL")?,
             database_max_connections: parsed_env("DATABASE_MAX_CONNECTIONS", 10)?,
-            binary_security_token: required_env("DIAN_BINARY_SECURITY_TOKEN")?,
             dian_hab_url: optional_env("DIAN_HAB_URL"),
             dian_prod_url: optional_env("DIAN_PROD_URL"),
             worker_id: optional_env("WORKER_ID").unwrap_or_else(|| {
@@ -116,15 +114,16 @@ async fn main() {
 
     let signer = Arc::new(TenantSigner::new(signer_config, store.clone()));
     info!(signing_mode = ?signer.mode(), "Firma configurada");
+    // Los envelopes SOAP se firman (WS-Security) con el mismo certificado del tenant.
     let soap = Arc::new(DianSoapClientImpl::new(
-        config.binary_security_token.clone(),
+        signer.clone(),
         config.dian_hab_url.clone(),
         config.dian_prod_url.clone(),
     ));
     let processor = Arc::new(DocumentProcessor::new(
         store.clone(),
         store.clone(),
-        signer,
+        signer.clone(),
         soap,
         Arc::new(Breakers::new(config.breaker_threshold, config.breaker_cooldown)),
         config.processor.clone(),

@@ -126,6 +126,13 @@ impl CryptoSigner for FakeSigner {
             "<ds:Signature><ds:SignatureValue>fake</ds:SignatureValue></ds:Signature>",
         ))
     }
+
+    async fn sign_soap_for_tenant(&self, tenant_id: Uuid, envelope: &str) -> Result<String, DomainError> {
+        Ok(envelope.replace(
+            core_domain::ports::WSSE_SECURITY_PLACEHOLDER,
+            &format!("<fake-wsse tenant=\"{}\"/>", tenant_id),
+        ))
+    }
 }
 
 pub fn ok(code: &str) -> Result<DianResponse, String> {
@@ -150,6 +157,8 @@ pub struct ScriptedSoap {
     pub status_calls: AtomicUsize,
     pub status_zip_calls: AtomicUsize,
     pub last_zip: Mutex<Vec<u8>>,
+    /// Tenant con cuya identidad se hizo la última llamada.
+    pub last_tenant: Mutex<Option<Uuid>>,
 }
 
 impl ScriptedSoap {
@@ -187,27 +196,29 @@ fn next<T>(queue: &Mutex<VecDeque<Result<T, String>>>, default: Result<T, String
 
 #[async_trait]
 impl DianSoapClient for ScriptedSoap {
-    async fn send_bill_sync(&self, zip: &[u8], _is_hab: bool) -> Result<DianResponse, DomainError> {
+    async fn send_bill_sync(&self, tenant_id: Uuid, zip: &[u8], _is_hab: bool) -> Result<DianResponse, DomainError> {
         self.send_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_tenant.lock().unwrap() = Some(tenant_id);
         *self.last_zip.lock().unwrap() = zip.to_vec();
         next(&self.send, ok("00"))
     }
-    async fn send_bill_async(&self, _zip: &[u8], _is_hab: bool) -> Result<String, DomainError> {
+    async fn send_bill_async(&self, _tenant_id: Uuid, _zip: &[u8], _is_hab: bool) -> Result<String, DomainError> {
         Ok("track".into())
     }
-    async fn send_test_set_async(&self, zip: &[u8], _id: &str, _is_hab: bool) -> Result<String, DomainError> {
+    async fn send_test_set_async(&self, _tenant_id: Uuid, zip: &[u8], _id: &str, _is_hab: bool) -> Result<String, DomainError> {
         *self.last_zip.lock().unwrap() = zip.to_vec();
         next(&self.test_set, Ok("zip-key-1".into()))
     }
-    async fn get_status(&self, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
+    async fn get_status(&self, _tenant_id: Uuid, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
         self.status_calls.fetch_add(1, Ordering::SeqCst);
         next(&self.status, ok("66"))
     }
-    async fn get_status_zip(&self, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
+    async fn get_status_zip(&self, _tenant_id: Uuid, _track_id: &str, _is_hab: bool) -> Result<DianResponse, DomainError> {
         self.status_zip_calls.fetch_add(1, Ordering::SeqCst);
         next(&self.status_zip, ok("00"))
     }
-    async fn send_event_update_status(&self, _zip: &[u8], _is_hab: bool) -> Result<DianResponse, DomainError> {
+    async fn send_event_update_status(&self, tenant_id: Uuid, _zip: &[u8], _is_hab: bool) -> Result<DianResponse, DomainError> {
+        *self.last_tenant.lock().unwrap() = Some(tenant_id);
         next(&self.send, ok("00"))
     }
 }

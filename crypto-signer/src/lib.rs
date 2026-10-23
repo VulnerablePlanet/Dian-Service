@@ -5,6 +5,7 @@ pub mod signer;
 pub mod vault;
 pub mod verify;
 pub mod xades;
+pub mod wssec;
 pub mod xmlutil;
 
 use error::CryptoError;

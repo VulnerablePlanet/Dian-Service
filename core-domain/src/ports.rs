@@ -232,24 +232,36 @@ pub trait HealthProbe: Send + Sync {
 pub trait CryptoSigner: Send + Sync {
     /// Firma el XML (XAdES-EPES) con el certificado que corresponde al tenant.
     async fn sign_for_tenant(&self, tenant_id: Uuid, xml: &str) -> Result<String, DomainError>;
+
+    /// Completa la cabecera WS-Security de un envelope SOAP con el certificado del tenant:
+    /// sustituye [`WSSE_SECURITY_PLACEHOLDER`] por `wsu:Timestamp`, `wsse:BinarySecurityToken`
+    /// y una `ds:Signature` que cubre el Timestamp y cada elemento que lleve `wsu:Id`.
+    async fn sign_soap_for_tenant(&self, tenant_id: Uuid, envelope: &str) -> Result<String, DomainError>;
 }
+
+/// Marcador que el cliente SOAP coloca dentro de `wsse:Security` para que el firmador
+/// inserte allí el Timestamp, el certificado y la firma.
+pub const WSSE_SECURITY_PLACEHOLDER: &str = "<!-- WSSE_SECURITY -->";
 
 #[async_trait]
 pub trait DianSoapClient: Send + Sync {
     async fn send_bill_sync(
         &self,
+        tenant_id: Uuid,
         signed_xml_zip: &[u8],
         is_hab: bool,
     ) -> Result<DianResponse, DomainError>;
 
     async fn send_bill_async(
         &self,
+        tenant_id: Uuid,
         signed_xml_zip: &[u8],
         is_hab: bool,
     ) -> Result<String, DomainError>; // Returns TrackId
 
     async fn send_test_set_async(
         &self,
+        tenant_id: Uuid,
         signed_xml_zip: &[u8],
         test_set_id: &str,
         is_hab: bool,
@@ -257,18 +269,21 @@ pub trait DianSoapClient: Send + Sync {
 
     async fn get_status(
         &self,
+        tenant_id: Uuid,
         track_id: &str,
         is_hab: bool,
     ) -> Result<DianResponse, DomainError>;
 
     async fn get_status_zip(
         &self,
+        tenant_id: Uuid,
         track_id: &str,
         is_hab: bool,
     ) -> Result<DianResponse, DomainError>;
 
     async fn send_event_update_status(
         &self,
+        tenant_id: Uuid,
         signed_event_zip: &[u8],
         is_hab: bool,
     ) -> Result<DianResponse, DomainError>;

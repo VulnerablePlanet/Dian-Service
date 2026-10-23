@@ -1,6 +1,7 @@
 use crate::error::CryptoError;
 use crate::provider::{CertificateProvider, LocalCertificateProvider, VaultCertificateProvider};
 use crate::sign_document;
+use crate::wssec::sign_soap_envelope;
 use crate::vault::VaultClient;
 use chrono::Utc;
 use async_trait::async_trait;
@@ -70,7 +71,24 @@ impl SignerConfig {
         tenant_id: Uuid,
         xml: &str,
     ) -> Result<String, CryptoError> {
-        let key_ref = match self.mode {
+        let key_ref = self.key_ref(certificates, tenant_id).await?;
+        sign_document(xml, self.provider.as_ref(), &key_ref).await
+    }
+
+    /// Firma la cabecera WS-Security del envelope con el certificado del tenant.
+    pub async fn sign_soap_for_tenant(
+        &self,
+        certificates: &dyn CertificateRepository,
+        tenant_id: Uuid,
+        envelope: &str,
+    ) -> Result<String, CryptoError> {
+        let key_ref = self.key_ref(certificates, tenant_id).await?;
+        sign_soap_envelope(envelope, self.provider.as_ref(), &key_ref).await
+    }
+
+    /// Referencia de la llave del tenant: su certificado activo y vigente, o el par local.
+    async fn key_ref(&self, certificates: &dyn CertificateRepository, tenant_id: Uuid) -> Result<String, CryptoError> {
+        Ok(match self.mode {
             KeyMode::SharedLocal => "local".to_string(),
             KeyMode::PerTenantVault => {
                 let cert = certificates
@@ -88,8 +106,7 @@ impl SignerConfig {
                 }
                 cert.vault_reference_path
             }
-        };
-        sign_document(xml, self.provider.as_ref(), &key_ref).await
+        })
     }
 }
 
@@ -114,6 +131,13 @@ impl CryptoSigner for TenantSigner {
     async fn sign_for_tenant(&self, tenant_id: Uuid, xml: &str) -> Result<String, DomainError> {
         self.config
             .sign_for_tenant(self.certificates.as_ref(), tenant_id, xml)
+            .await
+            .map_err(DomainError::from)
+    }
+
+    async fn sign_soap_for_tenant(&self, tenant_id: Uuid, envelope: &str) -> Result<String, DomainError> {
+        self.config
+            .sign_soap_for_tenant(self.certificates.as_ref(), tenant_id, envelope)
             .await
             .map_err(DomainError::from)
     }
@@ -194,5 +218,34 @@ mod tests {
         repo.add_certificate(certificate(tenant_id, Duration::days(30)));
         let signed = per_tenant_config().sign_for_tenant(&repo, tenant_id, XML).await.unwrap();
         assert!(signed.contains("<ds:SignatureValue"));
+    }
+
+    #[tokio::test]
+    async fn soap_envelopes_are_signed_with_the_tenant_certificate() {
+        let tenant_id = Uuid::new_v4();
+        let repo = Arc::new(InMemoryStore::default());
+        repo.add_certificate(certificate(tenant_id, Duration::days(30)));
+        let signer: Arc<dyn CryptoSigner> = Arc::new(TenantSigner::new(per_tenant_config(), repo));
+        let envelope = dian_soap_envelope();
+
+        let signed = signer.sign_soap_for_tenant(tenant_id, &envelope).await.unwrap();
+        assert!(signed.contains("<wsse:BinarySecurityToken") && signed.contains("<ds:SignatureValue>"));
+        assert!(
+            matches!(signer.sign_soap_for_tenant(Uuid::new_v4(), &envelope).await, Err(DomainError::Crypto(_))),
+            "a tenant without an active certificate cannot talk to the DIAN"
+        );
+    }
+
+    fn dian_soap_envelope() -> String {
+        format!(
+            concat!(
+                r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" "#,
+                r#"xmlns:wsse="{}" xmlns:wsu="{}"><soap:Header><wsse:Security>{}</wsse:Security>"#,
+                r#"<wsa:To wsu:Id="id-To">https://example.test</wsa:To></soap:Header><soap:Body/></soap:Envelope>"#
+            ),
+            crate::wssec::NS_WSSE,
+            crate::wssec::NS_WSU,
+            core_domain::ports::WSSE_SECURITY_PLACEHOLDER
+        )
     }
 }

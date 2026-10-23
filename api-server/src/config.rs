@@ -1,6 +1,5 @@
 /// Configuración del servidor REST leída del entorno al arrancar.
 pub struct ApiConfig {
-    pub dian_binary_security_token: String,
     /// Endpoints SOAP opcionales; si faltan se usan los oficiales de la DIAN.
     pub dian_hab_url: Option<String>,
     pub dian_prod_url: Option<String>,
@@ -15,7 +14,6 @@ pub struct ApiConfig {
 impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
-            dian_binary_security_token: required_env("DIAN_BINARY_SECURITY_TOKEN")?,
             dian_hab_url: optional_env("DIAN_HAB_URL"),
             dian_prod_url: optional_env("DIAN_PROD_URL"),
             inbound_allow_unverified_signatures: std::env::var("INBOUND_ALLOW_UNVERIFIED_SIGNATURES")

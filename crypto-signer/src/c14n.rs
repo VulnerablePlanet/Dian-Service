@@ -1,4 +1,5 @@
-//! Canonical XML 1.0 inclusivo, sin comentarios (W3C REC-xml-c14n-20010315).
+//! Canonical XML 1.0 sin comentarios, inclusivo (W3C REC-xml-c14n-20010315) y exclusivo
+//! (W3C REC-xml-exc-c14n-20020718, usado por WS-Security).
 //!
 //! Implementación propia sobre `quick-xml`. Reemplaza al crate `xml-canonicalization`, que
 //! ordenaba mal la declaración del namespace por defecto (la especificación la exige
@@ -7,12 +8,12 @@
 //! Alcance: documentos y fragmentos completos (no "document subsets"); los namespaces que un
 //! fragmento hereda se inyectan antes de llamar aquí (ver `xmlutil::with_namespaces`). Se
 //! rechazan DTDs y entidades no predefinidas. La conformidad se comprueba en las pruebas
-//! comparando contra `xmllint --c14n` (libxml2).
+//! comparando contra `xmllint --c14n` y `xmllint --exc-c14n` (libxml2).
 
 use crate::error::CryptoError;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
@@ -77,7 +78,13 @@ type Scope = BTreeMap<String, String>;
 
 struct Canonicalizer {
     out: String,
+    /// Namespaces en ámbito en cada nivel.
     scopes: Vec<Scope>,
+    /// Namespaces ya emitidos por los ancestros en cada nivel.
+    rendered: Vec<Scope>,
+    /// `None`: C14N inclusivo. `Some(prefijos)`: exclusivo, con la `InclusiveNamespaces
+    /// PrefixList` dada (el prefijo vacío representa `#default`).
+    exclusive: Option<BTreeSet<String>>,
     depth: usize,
     seen_root: bool,
 }
@@ -87,8 +94,7 @@ impl Canonicalizer {
         let name = std::str::from_utf8(start.name().as_ref().as_bytes())
             .map_err(|e| err(e.to_string()))?
             .to_string();
-        let parent = self.scopes.last().cloned().unwrap_or_default();
-        let mut scope = parent.clone();
+        let mut scope = self.scopes.last().cloned().unwrap_or_default();
         let mut attributes: Vec<(String, String, String, String)> = Vec::new(); // (ns, local, qname, value)
 
         let mut raw_attributes = Vec::new();
@@ -127,14 +133,40 @@ impl Canonicalizer {
         }
         attributes.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
-        // Declaraciones que cambian respecto al ancestro (un default ausente equivale a "").
-        // BTreeMap ordena por prefijo y el prefijo vacío (default) queda primero.
+        // Inclusivo: todos los namespaces en ámbito. Exclusivo: solo los que usan visiblemente
+        // el elemento o sus atributos, más los de la PrefixList.
+        let candidates: BTreeSet<String> = match &self.exclusive {
+            None => scope.keys().cloned().collect(),
+            Some(inclusive_prefixes) => {
+                let mut used = BTreeSet::new();
+                used.insert(name.split_once(':').map(|(p, _)| p.to_string()).unwrap_or_default());
+                for (_, _, qname, _) in &attributes {
+                    if let Some((prefix, _)) = qname.split_once(':') {
+                        if prefix != "xml" {
+                            used.insert(prefix.to_string());
+                        }
+                    }
+                }
+                used.extend(inclusive_prefixes.iter().filter(|p| scope.contains_key(*p)).cloned());
+                used
+            }
+        };
+        if let Some(prefix) = candidates.iter().find(|p| !p.is_empty() && !scope.contains_key(*p)) {
+            return Err(err(format!("Undeclared prefix '{}'", prefix)));
+        }
+
+        // Se emiten las declaraciones que difieren de lo ya emitido por los ancestros (un
+        // default ausente equivale a ""). BTreeSet ordena por prefijo: el default va primero.
+        let rendered_by_ancestors = self.rendered.last().cloned().unwrap_or_default();
+        let mut now_rendered = rendered_by_ancestors.clone();
         let mut rendered = String::new();
-        for (prefix, uri) in &scope {
-            let inherited = parent.get(prefix).map(String::as_str).unwrap_or("");
+        for prefix in &candidates {
+            let uri = scope.get(prefix).map(String::as_str).unwrap_or("");
+            let inherited = rendered_by_ancestors.get(prefix).map(String::as_str).unwrap_or("");
             if uri == inherited {
                 continue;
             }
+            now_rendered.insert(prefix.clone(), uri.to_string());
             if prefix.is_empty() {
                 rendered.push_str(" xmlns=\"");
             } else {
@@ -158,6 +190,7 @@ impl Canonicalizer {
         }
         self.out.push('>');
         self.scopes.push(scope);
+        self.rendered.push(now_rendered);
         self.depth += 1;
         self.seen_root = true;
         Ok(name)
@@ -168,17 +201,33 @@ impl Canonicalizer {
         self.out.push_str(name);
         self.out.push('>');
         self.scopes.pop();
+        self.rendered.pop();
         self.depth -= 1;
     }
 }
 
 /// Canonicaliza un documento (o fragmento completo) con C14N 1.0 inclusivo sin comentarios.
 pub fn canonicalize_xml(xml_content: &str) -> Result<String, CryptoError> {
+    canonicalize(xml_content, None)
+}
+
+/// Canonicaliza con C14N exclusivo sin comentarios. `inclusive_prefixes` es la
+/// `InclusiveNamespaces PrefixList` (vacía en el caso habitual; `""` equivale a `#default`).
+pub fn canonicalize_xml_exclusive(xml_content: &str, inclusive_prefixes: &[&str]) -> Result<String, CryptoError> {
+    canonicalize(
+        xml_content,
+        Some(inclusive_prefixes.iter().map(|p| p.to_string()).collect()),
+    )
+}
+
+fn canonicalize(xml_content: &str, exclusive: Option<BTreeSet<String>>) -> Result<String, CryptoError> {
     let mut reader = Reader::from_str(xml_content);
     reader.config_mut().trim_text(false);
     let mut c = Canonicalizer {
         out: String::with_capacity(xml_content.len()),
         scopes: Vec::new(),
+        rendered: Vec::new(),
+        exclusive,
         depth: 0,
         seen_root: false,
     };
@@ -287,23 +336,60 @@ mod tests {
         r#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:cac" xmlns:cbc="urn:cbc"><cbc:ID schemeID="31" schemeAgencyID="195">FE1</cbc:ID><cac:Party><cbc:Name>A &amp; B</cbc:Name></cac:Party></Invoice>"#,
     ];
 
-    #[test]
-    fn matches_libxml2_on_the_corpus() {
+    /// Casos propios del C14N exclusivo: namespaces no usados, redeclaraciones y prefijos que
+    /// solo aparecen en atributos (envelope SOAP con WS-Security).
+    const EXCLUSIVE_CORPUS: &[&str] = &[
+        r#"<a xmlns="urn:d" xmlns:unused="urn:u" xmlns:b="urn:b"><b:c><d b:attr="1"/></b:c></a>"#,
+        r#"<a xmlns="urn:d"><b xmlns=""><c xmlns="urn:d"/></b></a>"#,
+        r#"<p:a xmlns:p="urn:p"><p:b xmlns:p="urn:p2"><p:c/></p:b><q:d xmlns:q="urn:p"/></p:a>"#,
+        concat!(
+            r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" "#,
+            r#"xmlns:wcf="http://wcf.dian.colombia" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">"#,
+            r#"<soap:Header><wsa:To wsu:Id="id-To">https://vpfe-hab.dian.gov.co/WcfDianCustomerServices.svc</wsa:To></soap:Header>"#,
+            r#"<soap:Body><wcf:GetStatus><wcf:trackId>abc</wcf:trackId></wcf:GetStatus></soap:Body></soap:Envelope>"#
+        ),
+    ];
+
+    fn differential(cases: &[&str], flag: &str, ours: fn(&str) -> Result<String, CryptoError>) {
         if Command::new("xmllint").arg("--version").output().is_err() {
             assert!(std::env::var_os("CI").is_none(), "xmllint is required in CI");
             eprintln!("xmllint not installed: skipping C14N differential test");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("c14n-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("c14n-{}{}", std::process::id(), flag));
         std::fs::create_dir_all(&dir).unwrap();
-        for (i, input) in CORPUS.iter().enumerate() {
+        for (i, input) in cases.iter().enumerate() {
             let file = dir.join(format!("case{}.xml", i));
             std::fs::write(&file, input).unwrap();
-            let output = Command::new("xmllint").arg("--c14n").arg(&file).output().unwrap();
+            let output = Command::new("xmllint").arg(flag).arg(&file).output().unwrap();
             assert!(output.status.success(), "xmllint failed on case {}", i);
             let expected = String::from_utf8(output.stdout).unwrap();
-            let actual = canonicalize_xml(input).unwrap();
-            assert_eq!(actual, expected, "case {} differs from libxml2:\n{}", i, input);
+            let actual = ours(input).unwrap();
+            assert_eq!(actual, expected, "{} case {} differs from libxml2:\n{}", flag, i, input);
         }
+    }
+
+    #[test]
+    fn matches_libxml2_on_the_corpus() {
+        differential(CORPUS, "--c14n", canonicalize_xml);
+    }
+
+    #[test]
+    fn exclusive_matches_libxml2() {
+        let all: Vec<&str> = CORPUS.iter().chain(EXCLUSIVE_CORPUS).copied().collect();
+        differential(&all, "--exc-c14n", |xml| canonicalize_xml_exclusive(xml, &[]));
+    }
+
+    #[test]
+    fn exclusive_renders_only_visibly_used_namespaces() {
+        assert_eq!(
+            canonicalize_xml_exclusive(r#"<a xmlns="urn:d" xmlns:x="urn:x" xmlns:y="urn:y"><x:b y:c="1"/></a>"#, &[])
+                .unwrap(),
+            r#"<a xmlns="urn:d"><x:b xmlns:x="urn:x" xmlns:y="urn:y" y:c="1"></x:b></a>"#
+        );
+        assert_eq!(
+            canonicalize_xml_exclusive(r#"<x:a xmlns:x="urn:x" xmlns:y="urn:y"/>"#, &["y"]).unwrap(),
+            r#"<x:a xmlns:x="urn:x" xmlns:y="urn:y"></x:a>"#
+        );
     }
 }

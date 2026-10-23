@@ -23,7 +23,7 @@ worker ─────┘        │        └─► dian-soap-client (puerto D
 *   **`infra-postgres`**: adaptador PostgreSQL de los puertos: emisión atómica, transiciones de estado condicionales y la cola de trabajos (`FOR UPDATE SKIP LOCKED`, leases). Embebe las migraciones.
 *   **`ubl-engine`**: plantillas XML UBL 2.1 (MiniJinja, con autoescape), cálculo de CUFE/CUDE/CUDS/CUNE y empaquetado ZIP.
 *   **`crypto-signer`**: canonicalización C14N y firma **XAdES-EPES** (RSA + SHA-384), con certificado por tenant desde HashiCorp Vault o un par local para desarrollo.
-*   **`dian-soap-client`**: cliente SOAP 1.2 (WS-Addressing, timeouts) para los Web Services de la DIAN.
+*   **`dian-soap-client`**: cliente SOAP 1.2 (WS-Addressing, WS-Security firmado con el certificado del tenant, timeouts) para los Web Services de la DIAN.
 *   **`api-server`**: servidor REST (Axum) con autenticación por tenant.
 *   **`worker`**: proceso que reclama y procesa los trabajos de la cola.
 
@@ -57,9 +57,10 @@ Los binarios leen la configuración del **entorno del proceso** (no cargan un ar
 ```env
 # --- Obligatorias (api-server y worker) ---
 DATABASE_URL=postgres://tu_usuario:tu_contraseña@127.0.0.1:5432/dian
-DIAN_BINARY_SECURITY_TOKEN=tu_certificado_x509_en_base64
 
-# --- Firma XAdES: elige UNA de las dos opciones (obligatorio) ---
+# --- Firma (XAdES de documentos y WS-Security del SOAP): elige UNA opción (obligatorio) ---
+# El mismo certificado del tenant firma sus documentos y la cabecera WS-Security de cada
+# llamada a la DIAN (BinarySecurityToken + firma del Timestamp y wsa:To).
 # a) Producción: certificado por tenant desde HashiCorp Vault (KV v2). Cada tenant necesita
 #    una fila activa y vigente en `certificates`; su `vault_reference_path` es la ruta del secreto
 #    (campos `certificate` y `private_key`).
@@ -166,7 +167,25 @@ En una sola transacción de PostgreSQL se asigna el consecutivo, se guarda el do
 
 Posteriormente, el worker asíncrono se encarga del cálculo de CUFE, firmado XAdES-EPES, empaquetado ZIP y transmisión a la DIAN.
 
-> **Limitación actual:** `document_type` solo admite `"invoice"`. Las notas crédito y débito (`credit_note`, `debit_note`) se rechazan con `422` hasta que tengan su propia plantilla UBL (con `BillingReference`) y su CUDE.
+*   **Líneas de detalle (recomendado):** `lines` es una lista de `{ "description", "quantity", "unit_price", "tax_percent", "unit_code"? }`. Cada línea se calcula en decimal (`quantity × unit_price`, IVA por línea, redondeo a 2 decimales "half away from zero") y la suma debe coincidir exactamente con `net_amount` y `tax_amount`; el IVA del documento se agrupa por tarifa. Si se omite `lines`, se genera una única línea equivalente a los totales (compatibilidad).
+
+#### Notas crédito y débito
+
+El mismo endpoint emite `CreditNote` y `DebitNote` (UBL 2.1) con `document_type` `"credit_note"` o `"debit_note"`. Además de los campos de la factura requieren:
+
+```json
+{
+  "billing_reference": { "number": "FE1002", "cufe": "<CUFE de 96 caracteres>", "issue_date": "2026-05-23" },
+  "discrepancy": { "code": "2", "description": "Anulación de factura" },
+  "software_pin": "<PIN del software DIAN>"
+}
+```
+
+*   `discrepancy.code`: concepto de corrección, `1`-`6` en notas crédito y `1`-`4` en notas débito.
+*   El CUDE se calcula con el `software_pin` (no con la clave técnica) y el XML incluye `DiscrepancyResponse` y `BillingReference`.
+*   La numeración de cada tipo de nota se controla con su propio rango en `numbering_ranges` (`document_type` `credit_note`/`debit_note`, prefijo de la nota); el `technical_key` de ese rango no interviene.
+
+> **Validación:** el XML generado de facturas, notas, documento soporte, ApplicationResponse y AttachedDocument se valida en las pruebas contra los esquemas oficiales OASIS UBL 2.1 (`xmllint`). Las reglas propias del Anexo Técnico de la DIAN (extensiones `sts:DianExtensions`, listas de códigos) no están cubiertas por esa validación.
 
 ---
 

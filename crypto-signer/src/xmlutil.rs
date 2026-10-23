@@ -17,6 +17,11 @@ pub fn namespaces_in_scope_at(xml: &str, marker: &str) -> Result<BTreeMap<String
     let position = xml
         .find(marker)
         .ok_or_else(|| CryptoError::Xml(format!("marker '{}' not found", marker)))?;
+    namespaces_in_scope_before(xml, position)
+}
+
+/// Declaraciones de namespace vigentes en el byte `position` (inicio de un nodo).
+pub fn namespaces_in_scope_before(xml: &str, position: usize) -> Result<BTreeMap<String, String>, CryptoError> {
     let mut reader = Reader::from_str(&xml[..position]);
     let mut stack: Vec<Vec<(String, String)>> = Vec::new();
 
@@ -58,6 +63,57 @@ pub fn namespaces_in_scope_at(xml: &str, marker: &str) -> Result<BTreeMap<String
         }
     }
     Ok(scope)
+}
+
+/// Ubicación (inicio y fin, en bytes) de cada elemento que lleva un atributo `Id` con
+/// prefijo (p. ej. `wsu:Id`), en orden de aparición: `(id, inicio, fin)`.
+pub fn elements_with_prefixed_id(xml: &str) -> Result<Vec<(String, usize, usize)>, CryptoError> {
+    let mut reader = Reader::from_str(xml);
+    let mut found = Vec::new();
+    // (id, inicio, profundidad) de los elementos abiertos que llevan Id.
+    let mut open: Vec<(String, usize, usize)> = Vec::new();
+    let mut depth = 0usize;
+    loop {
+        let start = reader.buffer_position() as usize;
+        let event = reader.read_event().map_err(|e| CryptoError::Xml(format!("Invalid XML: {}", e)))?;
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let mut id = None;
+                for attribute in e.attributes() {
+                    let attribute = attribute.map_err(|e| CryptoError::Xml(e.to_string()))?;
+                    let key: &str = attribute.key.as_ref();
+                    if key.split_once(':').is_some_and(|(prefix, local)| local == "Id" && prefix != "xmlns") {
+                        id = Some(
+                            attribute
+                                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .map_err(|e| CryptoError::Xml(e.to_string()))?
+                                .into_owned(),
+                        );
+                    }
+                }
+                let empty = matches!(event, Event::Empty(_));
+                match (id, empty) {
+                    (Some(id), true) => found.push((id, start, reader.buffer_position() as usize)),
+                    (Some(id), false) => open.push((id, start, depth)),
+                    (None, _) => {}
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth -= 1;
+                if open.last().is_some_and(|(_, _, d)| *d == depth) {
+                    let (id, begin, _) = open.pop().expect("checked above");
+                    found.push((id, begin, reader.buffer_position() as usize));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    found.sort_by_key(|(_, begin, _)| *begin);
+    Ok(found)
 }
 
 /// Inserta en el elemento raíz de `fragment` las declaraciones de `namespaces` que el
@@ -106,6 +162,21 @@ mod tests {
         assert_eq!(scope.get(""), Some(&"urn:a".to_string()));
         assert_eq!(scope.get("x"), Some(&"urn:x2".to_string()), "inner declaration wins");
         assert!(!scope.contains_key("y"), "sibling scope is closed");
+    }
+
+    #[test]
+    fn finds_elements_with_prefixed_ids() {
+        let xml = r#"<e xmlns:u="urn:u"><a u:Id="A"><b u:Id="B"/></a><c Id="plain"/><d u:Id="D">x</d></e>"#;
+        let found = elements_with_prefixed_id(xml).unwrap();
+        let slices: Vec<(&str, &str)> = found.iter().map(|(id, s, e)| (id.as_str(), &xml[*s..*e])).collect();
+        assert_eq!(
+            slices,
+            vec![
+                ("A", r#"<a u:Id="A"><b u:Id="B"/></a>"#),
+                ("B", r#"<b u:Id="B"/>"#),
+                ("D", r#"<d u:Id="D">x</d>"#),
+            ]
+        );
     }
 
     #[test]
