@@ -2,10 +2,11 @@
 # se acepta temporalmente, y qué la resolvería. Revisar en cada actualización de dependencias.
 [advisories]
 ignore = [
-    # rsa 0.9 — Marvin Attack (canal lateral de tiempo). No existe versión corregida.
-    # Hoy las firmas PKCS#1 v1.5 se calculan en proceso: VaultCertificateProvider descarga la
-    # llave y firma localmente. Se resuelve firmando dentro de Vault Transit o un HSM (fase F4
-    # del plan), de modo que la llave privada nunca esté en este proceso.
+    # rsa 0.9 — Marvin Attack. Ningún binario del workspace compila `rsa`: el código firma con
+    # `ring` (en proceso) o con Vault Transit (producción), y
+    # `cargo tree -i rsa --workspace --target all -e all` no lo encuentra. Solo figura en
+    # Cargo.lock como dependencia de `sqlx-mysql`, que sqlx declara con features débiles
+    # aunque el workspace solo active PostgreSQL. Retirar al actualizar sqlx si desaparece.
     "RUSTSEC-2023-0071",
 
     # webpki-roots 0.26.11 es un "semver trick" que reexporta webpki-roots 1.x; el lockfile

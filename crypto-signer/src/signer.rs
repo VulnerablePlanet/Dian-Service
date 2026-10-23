@@ -1,5 +1,5 @@
 use crate::error::CryptoError;
-use crate::provider::{CertificateProvider, LocalCertificateProvider, VaultCertificateProvider};
+use crate::provider::{CertificateProvider, LocalCertificateProvider, VaultKvKeyProvider, VaultTransitProvider};
 use crate::sign_document;
 use crate::wssec::sign_soap_envelope;
 use crate::vault::VaultClient;
@@ -31,17 +31,30 @@ impl SignerConfig {
     }
 
     /// Lee la configuración del entorno:
-    /// - `VAULT_ADDR` + `VAULT_TOKEN`: certificado por tenant desde Vault.
+    /// - `VAULT_ADDR` + `VAULT_TOKEN`: certificado por tenant desde Vault. Con
+    ///   `VAULT_SIGNING_MODE=transit` (por defecto) la llave vive en Vault Transit y nunca
+    ///   sale de él; `kv` (legado) descarga la llave privada de KV v2. Mounts:
+    ///   `VAULT_KV_MOUNT` (`secret`) y `VAULT_TRANSIT_MOUNT` (`transit`).
     /// - `SIGNER_CERT_PATH` + `SIGNER_KEY_PATH`: par local compartido (solo desarrollo).
     pub fn from_env() -> Result<Self, CryptoError> {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
 
         if let (Some(addr), Some(token)) = (var("VAULT_ADDR"), var("VAULT_TOKEN")) {
-            let client = VaultClient::new(addr, token)?;
-            return Ok(Self::new(
-                Arc::new(VaultCertificateProvider::new(client)),
-                KeyMode::PerTenantVault,
-            ));
+            let client = VaultClient::new(addr, token)?.with_mounts(
+                var("VAULT_KV_MOUNT").unwrap_or_else(|| "secret".to_string()),
+                var("VAULT_TRANSIT_MOUNT").unwrap_or_else(|| "transit".to_string()),
+            )?;
+            let provider: Arc<dyn CertificateProvider> = match var("VAULT_SIGNING_MODE").as_deref() {
+                None | Some("transit") => Arc::new(VaultTransitProvider::new(client)),
+                Some("kv") => Arc::new(VaultKvKeyProvider::new(client)),
+                Some(other) => {
+                    return Err(CryptoError::Provider(format!(
+                        "Invalid VAULT_SIGNING_MODE '{}': use 'transit' or 'kv'",
+                        other
+                    )))
+                }
+            };
+            return Ok(Self::new(provider, KeyMode::PerTenantVault));
         }
 
         if let (Some(cert_path), Some(key_path)) = (var("SIGNER_CERT_PATH"), var("SIGNER_KEY_PATH")) {

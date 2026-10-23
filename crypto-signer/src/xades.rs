@@ -64,9 +64,27 @@ impl CertificateInfo {
             der_base64: der_base64.to_string(),
             digest_sha256: B64.encode(Sha256::digest(&der)),
             issuer_name: tbs.issuer.to_string(),
-            serial_number: rsa::BigUint::from_bytes_be(tbs.serial_number.as_bytes()).to_string(),
+            serial_number: decimal_from_be_bytes(tbs.serial_number.as_bytes()),
         })
     }
+}
+
+/// Entero sin signo big-endian en decimal (los números de serie X.509 llegan a 20 bytes).
+fn decimal_from_be_bytes(bytes: &[u8]) -> String {
+    let mut digits: Vec<u8> = vec![0]; // base 10, menos significativo primero
+    for &byte in bytes {
+        let mut carry = u32::from(byte);
+        for digit in digits.iter_mut() {
+            let value = u32::from(*digit) * 256 + carry;
+            *digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    digits.iter().rev().map(|d| char::from(b'0' + d)).collect()
 }
 
 fn sha256_b64(data: &str) -> String {
@@ -174,10 +192,7 @@ impl<'a> XadesSigner<'a> {
         );
 
         let signed_info_c14n = canonicalize_xml(&with_namespaces(&signed_info, &signature_scope))?;
-        let signature_value = self
-            .provider
-            .sign_sha256(key_ref, &Sha256::digest(signed_info_c14n.as_bytes()))
-            .await?;
+        let signature_value = self.provider.sign_rsa_sha256(key_ref, signed_info_c14n.as_bytes()).await?;
 
         let signature = format!(
             concat!(
@@ -196,5 +211,19 @@ impl<'a> XadesSigner<'a> {
         );
 
         Ok(xml_content.replace(SIGNATURE_PLACEHOLDER, &signature))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serial_numbers_are_rendered_in_decimal() {
+        assert_eq!(decimal_from_be_bytes(&[0]), "0");
+        assert_eq!(decimal_from_be_bytes(&[1, 0]), "256");
+        assert_eq!(decimal_from_be_bytes(&[0, 0xff]), "255");
+        // 2^128 - 1
+        assert_eq!(decimal_from_be_bytes(&[0xff; 16]), "340282366920938463463374607431768211455");
     }
 }

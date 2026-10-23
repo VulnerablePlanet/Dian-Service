@@ -120,11 +120,18 @@ mod tests {
 
     #[tokio::test]
     async fn sign_document_rejects_invalid_certificate_or_missing_placeholder() {
-        let provider = LocalCertificateProvider {
-            certificate_pem: "cert_dummy".to_string(),
-            private_key_pem: "key_dummy".to_string(),
-        };
-        assert!(sign_document(XML_INPUT, &provider, "local").await.is_err());
+        /// Proveedor que entrega un certificado que no es X.509.
+        struct BrokenCertificate;
+        #[async_trait::async_trait]
+        impl CertificateProvider for BrokenCertificate {
+            async fn get_certificate(&self, _: &str) -> Result<String, CryptoError> {
+                Ok("Y2VydF9kdW1teQ==".to_string())
+            }
+            async fn sign_rsa_sha256(&self, _: &str, _: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                Ok(vec![0; 256])
+            }
+        }
+        assert!(sign_document(XML_INPUT, &BrokenCertificate, "local").await.is_err());
         assert!(sign_document("<a/>", &self::provider(TEST_CERT_PEM, TEST_KEY_PEM), "local").await.is_err());
     }
 }

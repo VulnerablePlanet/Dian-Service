@@ -404,7 +404,6 @@ dependencies = [
  "quick-xml",
  "reqwest",
  "ring",
- "rsa",
  "serde",
  "serde_json",
  "sha2",

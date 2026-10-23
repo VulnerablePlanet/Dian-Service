@@ -101,9 +101,7 @@ pub async fn sign_soap_envelope(
     let mut signature_scope = scope.clone();
     signature_scope.insert("ds".to_string(), NS_DS.to_string());
     let signed_info_c14n = canonicalize_xml_exclusive(&with_namespaces(&signed_info, &signature_scope), &[])?;
-    let signature_value = provider
-        .sign_sha256(key_ref, &Sha256::digest(signed_info_c14n.as_bytes()))
-        .await?;
+    let signature_value = provider.sign_rsa_sha256(key_ref, signed_info_c14n.as_bytes()).await?;
 
     let signature = format!(
         concat!(

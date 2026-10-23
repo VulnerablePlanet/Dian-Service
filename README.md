@@ -51,7 +51,14 @@ for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP
 *   `20261021000000_harden_documents.sql` añade el estado `processing_failed`, distingue documentos emitidos y recibidos (`direction`, `issuer_nit`) en la clave única, y cambia el borrado en cascada de documentos y eventos por `ON DELETE RESTRICT`.
 *   `20261023000000_jobs_and_idempotency.sql` crea la cola de trabajos (`jobs`) y las claves de idempotencia (`idempotency_keys`), y asocia cada documento a su resolución de numeración. Si actualizas desde la versión con Redis, encola automáticamente los documentos que estaban en curso.
 
-### Paso 2: Configurar las Variables de Entorno
+### Paso 2 (producción): llave de firma del tenant en Vault Transit
+La política del token debe permitir `read` en `<kv>/data/<ruta del tenant>` y `update` en `<transit>/sign/<llave del tenant>`; nada más. Para cada tenant:
+
+1. Importa su llave RSA (la del certificado ONAC) como llave no exportable: `vault write transit/keys/<llave>/import type=rsa-2048 ciphertext=...` (BYOK, ver la documentación de Vault sobre *Transit key import*), o genera la llave en Transit y solicita el certificado a partir de ella.
+2. Guarda el certificado y el nombre de la llave: `vault kv put secret/tenants/<tenant> certificate=@cert.pem transit_key=<llave>`.
+3. Registra la fila en `certificates` con `vault_reference_path = 'tenants/<tenant>'`.
+
+### Paso 3: Configurar las Variables de Entorno
 Los binarios leen la configuración del **entorno del proceso** (no cargan un archivo `.env` por sí mismos; usa tu orquestador, `env $(cat .env | xargs) cargo run ...` o similar). Las variables obligatorias no tienen valor por defecto: si falta alguna, el proceso termina al arrancar con un mensaje explícito.
 
 ```env
@@ -61,11 +68,18 @@ DATABASE_URL=postgres://tu_usuario:tu_contraseña@127.0.0.1:5432/dian
 # --- Firma (XAdES de documentos y WS-Security del SOAP): elige UNA opción (obligatorio) ---
 # El mismo certificado del tenant firma sus documentos y la cabecera WS-Security de cada
 # llamada a la DIAN (BinarySecurityToken + firma del Timestamp y wsa:To).
-# a) Producción: certificado por tenant desde HashiCorp Vault (KV v2). Cada tenant necesita
-#    una fila activa y vigente en `certificates`; su `vault_reference_path` es la ruta del secreto
-#    (campos `certificate` y `private_key`).
+# a) Producción: certificado por tenant en HashiCorp Vault. Cada tenant necesita una fila activa
+#    y vigente en `certificates`; su `vault_reference_path` es la ruta de un secreto KV v2.
+#    - VAULT_SIGNING_MODE=transit (por defecto): la llave RSA vive en Vault Transit (no
+#      exportable) y firma Vault; el secreto KV contiene `certificate` (PEM) y `transit_key`
+#      (nombre de la llave en Transit). La llave privada nunca llega a este proceso.
+#    - VAULT_SIGNING_MODE=kv (legado): el secreto KV contiene `certificate` y `private_key`;
+#      la llave se descarga y se firma en el proceso. Solo para migrar instalaciones existentes.
 VAULT_ADDR=https://vault.example.com
 VAULT_TOKEN=...
+# VAULT_SIGNING_MODE=transit
+# VAULT_KV_MOUNT=secret
+# VAULT_TRANSIT_MOUNT=transit
 # b) Desarrollo: un único par local compartido por todos los tenants.
 # SIGNER_CERT_PATH=/ruta/cert.pem
 # SIGNER_KEY_PATH=/ruta/key.pem
@@ -99,7 +113,7 @@ POLL_INTERVAL_MS=1000
 
 Si la firma de un documento falla (por ejemplo, el tenant no tiene un certificado activo y vigente), el documento pasa a `processing_failed` y el motivo queda en `dian_events`.
 
-### Paso 3: Compilar y Ejecutar
+### Paso 4: Compilar y Ejecutar
 
 El proyecto se divide en dos binarios independientes:
 

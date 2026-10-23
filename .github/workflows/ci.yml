@@ -78,3 +78,6 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - name: cargo audit
         run: cargo audit
+      # La excepción de RUSTSEC-2023-0071 en .cargo/audit.toml solo vale si `rsa` no se compila.
+      - name: rsa is not compiled
+        run: test -z "$(cargo tree -i rsa --workspace --target all -e all 2>/dev/null)"
