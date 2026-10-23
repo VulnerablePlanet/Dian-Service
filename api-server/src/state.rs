@@ -15,6 +15,7 @@ pub struct AppState {
     pub inbound: InboundService,
     pub radian: RadianService,
     pub config: ApiConfig,
+    pub metrics: Arc<crate::metrics::HttpMetrics>,
 }
 
 pub type SharedState = Arc<AppState>;

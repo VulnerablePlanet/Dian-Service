@@ -22,10 +22,11 @@ worker ─────┘        │        └─► dian-soap-client (puerto D
 *   **`application`**: casos de uso: emisión (`IssueService`, con idempotencia), procesamiento de la cola (`DocumentProcessor`: firma, transmisión, consulta de estado, contingencia), facturas recibidas y eventos RADIAN. También el circuit breaker por ambiente y el backoff.
 *   **`infra-postgres`**: adaptador PostgreSQL de los puertos: emisión atómica, transiciones de estado condicionales y la cola de trabajos (`FOR UPDATE SKIP LOCKED`, leases). Embebe las migraciones.
 *   **`ubl-engine`**: plantillas XML UBL 2.1 (MiniJinja, con autoescape), cálculo de CUFE/CUDE/CUDS/CUNE y empaquetado ZIP.
-*   **`crypto-signer`**: canonicalización C14N y firma **XAdES-EPES** (RSA + SHA-384), con certificado por tenant desde HashiCorp Vault o un par local para desarrollo.
+*   **`crypto-signer`**: canonicalización C14N (inclusiva y exclusiva), firma **XAdES-EPES** (RSA-SHA256) y WS-Security, verificación de firmas con `xmlsec1`; firma con Vault Transit por tenant o con un par local para desarrollo.
 *   **`dian-soap-client`**: cliente SOAP 1.2 (WS-Addressing, WS-Security firmado con el certificado del tenant, timeouts) para los Web Services de la DIAN.
 *   **`api-server`**: servidor REST (Axum) con autenticación por tenant.
 *   **`worker`**: proceso que reclama y procesa los trabajos de la cola.
+*   **`observability`**: logs JSON, métricas Prometheus y sondas `/livez`/`/readyz` comunes a ambos binarios.
 
 ---
 
@@ -50,6 +51,7 @@ for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP
 *   `20260523000000_init.sql` crea las tablas (`tenants`, `certificates`, `numbering_ranges`, `documents`, `dian_events`, `webhooks`) y sus índices.
 *   `20261021000000_harden_documents.sql` añade el estado `processing_failed`, distingue documentos emitidos y recibidos (`direction`, `issuer_nit`) en la clave única, y cambia el borrado en cascada de documentos y eventos por `ON DELETE RESTRICT`.
 *   `20261023000000_jobs_and_idempotency.sql` crea la cola de trabajos (`jobs`) y las claves de idempotencia (`idempotency_keys`), y asocia cada documento a su resolución de numeración. Si actualizas desde la versión con Redis, encola automáticamente los documentos que estaban en curso.
+*   `20261024000000_dead_jobs_index.sql` indexa la cola de errores (trabajos `dead`) para las métricas y la administración.
 
 ### Paso 2 (producción): llave de firma del tenant en Vault Transit
 La política del token debe permitir `read` en `<kv>/data/<ruta del tenant>` y `update` en `<transit>/sign/<llave del tenant>`; nada más. Para cada tenant:
@@ -87,6 +89,8 @@ VAULT_TOKEN=...
 # --- Opcionales ---
 PORT=8080
 RUST_LOG=info
+LOG_FORMAT=json                          # json (por defecto) o text
+METRICS_ADDR=0.0.0.0:9090                # métricas (api-server: 9090, worker: 9091); off las desactiva
 DATABASE_MAX_CONNECTIONS=10
 # Worker
 MAX_CONCURRENT_JOBS=5                    # trabajos procesados en paralelo
@@ -341,12 +345,18 @@ Registra transacciones de compras realizadas a sujetos no obligados a facturar.
 
 ---
 
-### G. Monitoreo y Diagnóstico (Health Check)
+### G. Monitoreo, sondas y métricas
 
-Permite consultar el estado operativo de las dependencias clave.
-
-*   **Endpoint:** `GET /api/v1/health` (Acceso público, no requiere API Key)
-*   **Respuesta:** `200 OK` con `{"status": "UP", "database": "CONNECTED"}`, o `503 Service Unavailable` con `{"status": "DOWN", "database": "DISCONNECTED"}` si PostgreSQL no responde.
+*   **Sondas (sin API key):**
+    *   `GET /livez`: `200` mientras el proceso responde (no consulta dependencias).
+    *   `GET /readyz`: `200` si PostgreSQL responde, `503` si no.
+    *   `GET /api/v1/health`: compatibilidad (`{"status": "UP"|"DOWN"}`, `200`/`503`).
+    *   El worker expone `/livez`, `/readyz` y `/metrics` en `METRICS_ADDR` (por defecto `0.0.0.0:9091`).
+*   **Métricas Prometheus (formato OpenMetrics):** la API las sirve en un listener aparte, `METRICS_ADDR` (por defecto `0.0.0.0:9090`; `off` lo desactiva), nunca en el puerto público.
+    *   API: `dian_api_http_requests_total{method,route,status}` y `dian_api_http_request_duration_seconds{method,route}`; `route` es la plantilla (`/api/v1/documents/:id`), no la URL.
+    *   Worker: `dian_worker_jobs_total{kind,outcome}` (`handled`, `error`, `timeout`), `dian_worker_job_duration_seconds{kind}`, `dian_worker_jobs_in_flight`, `dian_worker_queue_jobs{state}` (`ready`, `scheduled`, `running`, `dead`) y `dian_worker_dian_breaker_open{environment}`.
+    *   Alertas sugeridas: `dian_worker_queue_jobs{state="dead"} > 0` (documentos en contingencia que requieren intervención), `dian_worker_queue_jobs{state="ready"}` creciendo sostenidamente (backlog), `dian_worker_dian_breaker_open == 1` durante más de unos minutos, y tasa de `5xx` en la API.
+*   **Logs:** una línea JSON por evento (`LOG_FORMAT=text` para formato legible; nivel con `RUST_LOG`). Cada petición HTTP registra método, ruta, estado, latencia, `request_id` y `tenant_id`; la cabecera `x-request-id` del cliente se propaga (o se genera) y se devuelve en la respuesta. Cada trabajo del worker registra `job_id`, `document_id`, `kind` y `attempt`.
 
 ---
 

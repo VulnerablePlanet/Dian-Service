@@ -253,7 +253,7 @@ impl DocumentProcessor {
     async fn transmission_failed(&self, job: &Job, document: &Document, error: DomainError) -> Result<(), DomainError> {
         self.breakers.for_environment(is_habilitacion(document)).record_failure().await;
         let message = error.to_string();
-        warn!(document_id = %document.id, attempt = job.attempts, %message, "transmission failed");
+        warn!(document_id = %document.id, attempt = job.attempts, error = %message, "transmission failed");
         let event = DianEvent::new(document.id, EventStatus::Error, "HTTP_ERROR", message.clone());
 
         if job.is_last_attempt() {

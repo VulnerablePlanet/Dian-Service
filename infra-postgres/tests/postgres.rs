@@ -358,6 +358,24 @@ async fn contingency_documents_are_requeued_once() {
 }
 
 #[tokio::test]
+async fn queue_depth_counts_jobs_by_state() {
+    let Some(f) = fixture().await else { return };
+    f.add_range(DocumentType::Invoice, "FE", 1, 1000).await;
+    for _ in 0..3 {
+        f.issue("FE", None).await.unwrap();
+    }
+    let store = f.store.clone();
+    let mut claimed = store.claim("w", 2, Duration::from_secs(600)).await.unwrap();
+    let dead = claimed.remove(0);
+    store.bury(dead.id, "gave up").await.unwrap();
+    let depth = store.queue_depth().await.unwrap();
+    assert_eq!((depth.ready, depth.scheduled, depth.running, depth.dead), (1, 0, 1, 1));
+
+    store.retry(claimed[0].id, Utc::now() + ChronoDuration::minutes(5), "later").await.unwrap();
+    assert_eq!(store.queue_depth().await.unwrap().scheduled, 1);
+}
+
+#[tokio::test]
 async fn tenants_cannot_be_deleted_while_they_have_documents() {
     let Some(f) = fixture().await else { return };
     f.add_range(DocumentType::Invoice, "FE", 1, 1000).await;

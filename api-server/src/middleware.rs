@@ -28,6 +28,16 @@ pub async fn auth_middleware(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("Unauthorized: Invalid API Key".to_string()))?;
 
+    tracing::Span::current().record("tenant_id", tracing::field::display(tenant.id));
     request.extensions_mut().insert(tenant);
     Ok(next.run(request).await)
+}
+
+/// Las respuestas de la API contienen datos tributarios: ningún intermediario debe guardarlas.
+pub async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+    response
 }

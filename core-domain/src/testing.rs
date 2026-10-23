@@ -467,6 +467,22 @@ impl JobRepository for InMemoryStore {
         }
         Ok(candidates.len() as u64)
     }
+
+    async fn queue_depth(&self) -> Result<crate::jobs::QueueDepth, DomainError> {
+        let state = self.state.lock().unwrap();
+        let now = Utc::now();
+        let mut depth = crate::jobs::QueueDepth::default();
+        for job in state.jobs.values() {
+            match job.status {
+                JobStatus::Queued if job.run_at <= now => depth.ready += 1,
+                JobStatus::Queued => depth.scheduled += 1,
+                JobStatus::Running => depth.running += 1,
+                JobStatus::Dead => depth.dead += 1,
+                JobStatus::Done => {}
+            }
+        }
+        Ok(depth)
+    }
 }
 
 #[async_trait]

@@ -31,6 +31,18 @@ impl Job {
     }
 }
 
+/// Trabajos pendientes por estado, para métricas y alertas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// En cola y listos para ejecutarse.
+    pub ready: i64,
+    /// En cola con ejecución programada para más tarde (reintentos, consultas de estado).
+    pub scheduled: i64,
+    pub running: i64,
+    /// Agotaron sus intentos (cola de errores): requieren intervención.
+    pub dead: i64,
+}
+
 /// Trabajo por encolar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewJob {

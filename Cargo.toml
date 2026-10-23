@@ -9,6 +9,7 @@ members = [
     "dian-soap-client",
     "worker",
     "api-server",
+    "observability",
 ]
 
 [workspace.dependencies]
@@ -31,8 +32,8 @@ base64 = "0.22"
 ring = "0.17"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 axum = "0.7"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id"] }
 hmac = "0.12.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-opentelemetry = "0.22"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+prometheus-client = "0.22"

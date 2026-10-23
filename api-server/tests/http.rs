@@ -1,6 +1,7 @@
 //! Pruebas HTTP del router completo sobre el repositorio en memoria.
 
 use api_server::config::ApiConfig;
+use api_server::metrics::HttpMetrics;
 use api_server::state::AppState;
 use application::inbound::InboundService;
 use application::issue::IssueService;
@@ -145,6 +146,15 @@ fn config() -> ApiConfig {
 }
 
 fn app_with(documents: Arc<dyn DocumentRepository>, health: Arc<dyn HealthProbe>, store: Arc<InMemoryStore>) -> axum::Router {
+    app_with_metrics(documents, health, store, Arc::new(HttpMetrics::default()))
+}
+
+fn app_with_metrics(
+    documents: Arc<dyn DocumentRepository>,
+    health: Arc<dyn HealthProbe>,
+    store: Arc<InMemoryStore>,
+    metrics: Arc<HttpMetrics>,
+) -> axum::Router {
     api_server::router(Arc::new(AppState {
         tenants: store,
         documents: documents.clone(),
@@ -153,6 +163,7 @@ fn app_with(documents: Arc<dyn DocumentRepository>, health: Arc<dyn HealthProbe>
         inbound: InboundService::new(documents.clone(), None),
         radian: RadianService::new(documents, Arc::new(NoSigner), Arc::new(NoSoap)),
         config: config(),
+        metrics,
     }))
 }
 
@@ -299,4 +310,54 @@ async fn infrastructure_failures_return_5xx_without_internal_details() {
     let (status, _, body) = send(&app, "GET", "/api/v1/health", None, &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["status"], "DOWN");
+
+    assert_eq!(send(&app, "GET", "/livez", None, &[]).await.0, StatusCode::OK, "liveness ignores dependencies");
+    assert_eq!(send(&app, "GET", "/readyz", None, &[]).await.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn requests_are_measured_by_route_template_and_status() {
+    let store = Arc::new(InMemoryStore::default());
+    let t = tenant();
+    store.add_range(range(&t, DocumentType::Invoice, "FE"));
+    store.add_tenant(t);
+    let metrics = Arc::new(HttpMetrics::default());
+    let app = app_with_metrics(store.clone(), store.clone(), store, metrics.clone());
+
+    send(&app, "POST", "/api/v1/invoices", Some(invoice(1)), &[AUTH]).await;
+    let missing = format!("/api/v1/documents/{}", Uuid::new_v4());
+    send(&app, "GET", &missing, None, &[AUTH]).await;
+    send(&app, "GET", &missing, None, &[]).await;
+    assert_eq!(send(&app, "GET", "/readyz", None, &[]).await.0, StatusCode::OK);
+
+    let mut registry = prometheus_client::registry::Registry::default();
+    metrics.register(&mut registry);
+    let mut text = String::new();
+    prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
+    for expected in [
+        r#"http_requests_total{method="POST",route="/api/v1/invoices",status="202"} 1"#,
+        r#"http_requests_total{method="GET",route="/api/v1/documents/:id",status="404"} 1"#,
+        r#"http_requests_total{method="GET",route="/api/v1/documents/:id",status="401"} 1"#,
+        r#"http_request_duration_seconds_count{method="POST",route="/api/v1/invoices"} 1"#,
+    ] {
+        assert!(text.contains(expected), "missing {}\n{}", expected, text);
+    }
+    assert!(!text.contains(&missing), "concrete URLs must not become labels");
+}
+
+#[tokio::test]
+async fn responses_carry_request_id_and_are_not_cacheable() {
+    let (app, _) = app();
+    let request = |id: Option<&str>| {
+        let mut builder = Request::builder().uri("/livez");
+        if let Some(id) = id {
+            builder = builder.header("x-request-id", id);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let generated = app.clone().oneshot(request(None)).await.unwrap();
+    assert!(Uuid::parse_str(generated.headers()["x-request-id"].to_str().unwrap()).is_ok());
+    assert_eq!(generated.headers()["cache-control"], "no-store");
+    let propagated = app.clone().oneshot(request(Some("erp-req-42"))).await.unwrap();
+    assert_eq!(propagated.headers()["x-request-id"], "erp-req-42");
 }

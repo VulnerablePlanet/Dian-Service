@@ -6,6 +6,9 @@
 //!   cuando el lease vence.
 //! - Un reconciliador periódico devuelve a la cola los documentos en contingencia.
 //! - Ante SIGTERM/SIGINT deja de reclamar y espera a que terminen los trabajos en curso.
+//! - Logs JSON con un span por trabajo; `/livez`, `/readyz` y `/metrics` en `METRICS_ADDR`.
+
+mod metrics;
 
 use application::processing::{DocumentProcessor, ProcessorConfig};
 use application::resilience::Breakers;
@@ -14,12 +17,13 @@ use crypto_signer::signer::{SignerConfig, TenantSigner};
 use dian_soap_client::client::DianSoapClientImpl;
 use infra_postgres::PgStore;
 use sqlx::postgres::PgPoolOptions;
+use metrics::WorkerMetrics;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Semaphore};
-use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing::{error, info, info_span, warn, Instrument};
 
 struct WorkerConfig {
     database_url: String,
@@ -35,6 +39,7 @@ struct WorkerConfig {
     contingency_interval: Duration,
     breaker_threshold: u32,
     breaker_cooldown: Duration,
+    metrics_addr: Option<SocketAddr>,
     processor: ProcessorConfig,
 }
 
@@ -86,6 +91,11 @@ impl WorkerConfig {
             contingency_interval: seconds_env("CONTINGENCY_REQUEUE_INTERVAL_SECS", 300)?,
             breaker_threshold: parsed_env("BREAKER_FAILURE_THRESHOLD", 3)?,
             breaker_cooldown: seconds_env("BREAKER_COOLDOWN_SECS", 30)?,
+            // `off` desactiva el listener de sondas y métricas.
+            metrics_addr: match optional_env("METRICS_ADDR").as_deref().unwrap_or("0.0.0.0:9091") {
+                "off" => None,
+                value => Some(value.parse().map_err(|_| format!("Invalid METRICS_ADDR '{}'", value))?),
+            },
             processor: ProcessorConfig {
                 transmit_max_attempts: parsed_env("TRANSMIT_MAX_ATTEMPTS", 5)?,
                 poll_max_attempts: parsed_env("POLL_MAX_ATTEMPTS", 30)?,
@@ -97,9 +107,7 @@ impl WorkerConfig {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn")))
-        .init();
+    observability::init_tracing("info,sqlx=warn");
 
     let config = WorkerConfig::from_env().unwrap_or_else(|e| exit_with(&e));
     let signer_config = SignerConfig::from_env().unwrap_or_else(|e| exit_with(&e.to_string()));
@@ -120,12 +128,13 @@ async fn main() {
         config.dian_hab_url.clone(),
         config.dian_prod_url.clone(),
     ));
+    let breakers = Arc::new(Breakers::new(config.breaker_threshold, config.breaker_cooldown));
     let processor = Arc::new(DocumentProcessor::new(
         store.clone(),
         store.clone(),
         signer.clone(),
         soap,
-        Arc::new(Breakers::new(config.breaker_threshold, config.breaker_cooldown)),
+        breakers.clone(),
         config.processor.clone(),
     ));
 
@@ -134,6 +143,26 @@ async fn main() {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     });
+
+    let metrics = Arc::new(WorkerMetrics::default());
+    if let Some(addr) = config.metrics_addr {
+        let mut registry = observability::prometheus_client::registry::Registry::with_prefix("dian_worker");
+        metrics.register(&mut registry);
+        let router = axum::Router::new()
+            .merge(observability::probe_routes(store.clone()))
+            .merge(observability::metrics_routes(Arc::new(registry)));
+        let mut stop = shutdown_rx.clone();
+        tokio::spawn(async move {
+            info!(%addr, "Sondas y metricas en /livez, /readyz y /metrics");
+            let shutdown = async move {
+                let _ = stop.wait_for(|stopping| *stopping).await;
+            };
+            if let Err(e) = observability::serve(addr, router, shutdown).await {
+                error!(error = %e, "metrics listener failed");
+            }
+        });
+    }
+    tokio::spawn(sampler(store.clone(), breakers, metrics.clone(), shutdown_rx.clone()));
 
     tokio::spawn(contingency_reconciler(
         processor.clone(),
@@ -147,7 +176,7 @@ async fn main() {
         "Worker listo"
     );
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_jobs));
-    claim_loop(&config, store, processor, semaphore.clone(), shutdown_rx).await;
+    claim_loop(&config, store, processor, metrics, semaphore.clone(), shutdown_rx).await;
 
     info!("Apagado: esperando a que terminen los trabajos en curso");
     let all = u32::try_from(config.max_concurrent_jobs).unwrap_or(u32::MAX);
@@ -165,6 +194,7 @@ async fn claim_loop(
     config: &WorkerConfig,
     store: Arc<PgStore>,
     processor: Arc<DocumentProcessor>,
+    metrics: Arc<WorkerMetrics>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -187,20 +217,40 @@ async fn claim_loop(
                 for job in jobs {
                     let Ok(permit) = semaphore.clone().acquire_owned().await else { return };
                     let processor = processor.clone();
+                    let metrics = metrics.clone();
                     let timeout = config.job_timeout;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let (job_id, document_id, kind) = (job.id, job.document_id, job.kind);
-                        match tokio::time::timeout(timeout, processor.process(job)).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                error!(%job_id, %document_id, %kind, error = %e, "job failed; it will be retried when its lease expires")
-                            }
-                            Err(_) => {
-                                error!(%job_id, %document_id, %kind, "job timed out; it will be retried when its lease expires")
-                            }
+                    // Todo log emitido al procesar el trabajo lleva estos campos.
+                    let span = info_span!(
+                        "job",
+                        job_id = %job.id,
+                        document_id = %job.document_id,
+                        kind = %job.kind,
+                        attempt = job.attempts
+                    );
+                    tokio::spawn(
+                        async move {
+                            let _permit = permit;
+                            let kind = job.kind.to_string();
+                            metrics.in_flight.inc();
+                            let started = Instant::now();
+                            let outcome = match tokio::time::timeout(timeout, processor.process(job)).await {
+                                // Procesado (incluye reintentos programados); el resultado ante la
+                                // DIAN queda en el estado del documento y en sus eventos.
+                                Ok(Ok(())) => "handled",
+                                Ok(Err(e)) => {
+                                    error!(error = %e, "job failed; it will be retried when its lease expires");
+                                    "error"
+                                }
+                                Err(_) => {
+                                    error!("job timed out; it will be retried when its lease expires");
+                                    "timeout"
+                                }
+                            };
+                            metrics.in_flight.dec();
+                            metrics.job_finished(&kind, outcome, started.elapsed().as_secs_f64());
                         }
-                    });
+                        .instrument(span),
+                    );
                 }
             }
             Ok(_) => idle(config.poll_interval, &mut shutdown).await,
@@ -233,6 +283,26 @@ async fn contingency_reconciler(
             Ok(0) => {}
             Ok(count) => info!(count, "documentos en contingencia devueltos a la cola"),
             Err(e) => error!(error = %e, "contingency reconciliation failed"),
+        }
+    }
+}
+
+/// Muestrea periódicamente la profundidad de la cola y el estado de los circuit breakers.
+async fn sampler(
+    store: Arc<PgStore>,
+    breakers: Arc<Breakers>,
+    metrics: Arc<WorkerMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        match store.queue_depth().await {
+            Ok(depth) => metrics.set_queue_depth(depth),
+            Err(e) => warn!(error = %e, "could not sample queue depth"),
+        }
+        metrics.sample_breakers(&breakers).await;
+        idle(Duration::from_secs(15), &mut shutdown).await;
+        if *shutdown.borrow() {
+            return;
         }
     }
 }

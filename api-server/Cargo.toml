@@ -14,6 +14,8 @@ infra-postgres = { path = "../infra-postgres" }
 ubl-engine = { path = "../ubl-engine" }
 crypto-signer = { path = "../crypto-signer" }
 dian-soap-client = { path = "../dian-soap-client" }
+observability = { path = "../observability" }
+prometheus-client = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,7 +24,6 @@ tower-http = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }

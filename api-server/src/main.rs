@@ -1,6 +1,6 @@
 use api_server::config::{optional_env, parsed_env, required_env, ApiConfig};
 use api_server::state::AppState;
-use api_server::telemetry::init_telemetry;
+use api_server::metrics::HttpMetrics;
 use application::inbound::{InboundService, InboundVerification};
 use application::issue::IssueService;
 use application::radian::RadianService;
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    init_telemetry();
+    observability::init_tracing("info,api_server=debug,sqlx=warn");
 
     // Configuración obligatoria: sin valores por defecto para conexiones ni secretos.
     let db_url = required_env("DATABASE_URL").unwrap_or_else(|e| exit_with(&e));
@@ -57,6 +57,11 @@ async fn main() {
         config.dian_prod_url.clone(),
     ));
 
+    let metrics = Arc::new(HttpMetrics::default());
+    let mut registry = observability::prometheus_client::registry::Registry::with_prefix("dian_api");
+    metrics.register(&mut registry);
+    let metrics_addr = metrics_addr("0.0.0.0:9090").unwrap_or_else(|e| exit_with(&e));
+
     let state = Arc::new(AppState {
         tenants: store.clone(),
         documents: store.clone(),
@@ -65,7 +70,19 @@ async fn main() {
         inbound: InboundService::new(store.clone(), inbound_verification),
         radian: RadianService::new(store.clone(), signer, soap),
         config,
+        metrics,
     });
+
+    // Métricas en un puerto aparte, para no exponerlas en el listener público.
+    if let Some(addr) = metrics_addr {
+        let router = observability::metrics_routes(Arc::new(registry));
+        tokio::spawn(async move {
+            tracing::info!(%addr, "Metricas expuestas en /metrics");
+            if let Err(e) = observability::serve(addr, router, shutdown_signal()).await {
+                tracing::error!(error = %e, "metrics listener failed");
+            }
+        });
+    }
 
     let port = optional_env("PORT").unwrap_or_else(|| "8080".to_string());
     let addr: SocketAddr = format!("0.0.0.0:{}", port)
@@ -100,6 +117,17 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("Senal de apagado recibida: terminando solicitudes en curso");
+}
+
+/// `METRICS_ADDR`: dirección del listener de métricas; `off` lo desactiva.
+fn metrics_addr(default: &str) -> Result<Option<SocketAddr>, String> {
+    match optional_env("METRICS_ADDR").as_deref().unwrap_or(default) {
+        "off" => Ok(None),
+        value => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("Invalid METRICS_ADDR '{}'", value)),
+    }
 }
 
 fn exit_with(message: &str) -> ! {

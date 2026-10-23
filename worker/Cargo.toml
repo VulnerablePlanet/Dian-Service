@@ -13,7 +13,9 @@ application = { path = "../application" }
 infra-postgres = { path = "../infra-postgres" }
 crypto-signer = { path = "../crypto-signer" }
 dian-soap-client = { path = "../dian-soap-client" }
+observability = { path = "../observability" }
+prometheus-client = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

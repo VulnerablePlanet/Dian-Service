@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use core_domain::jobs::{Job, NewJob};
+use core_domain::jobs::{Job, NewJob, QueueDepth};
 use core_domain::models::{
     Certificate, DianEvent, Document, DocumentStatus, NumberingRange, Tenant,
 };
@@ -646,6 +646,20 @@ impl JobRepository for PgStore {
         .await
         .map_err(db)?;
         Ok(result.rows_affected())
+    }
+
+    async fn queue_depth(&self) -> Result<QueueDepth, DomainError> {
+        let (ready, scheduled, running, dead): (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE status = 'queued' AND run_at <= now()),
+                    count(*) FILTER (WHERE status = 'queued' AND run_at > now()),
+                    count(*) FILTER (WHERE status = 'running'),
+                    count(*) FILTER (WHERE status = 'dead')
+             FROM jobs WHERE status IN ('queued', 'running', 'dead')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(QueueDepth { ready, scheduled, running, dead })
     }
 }
 

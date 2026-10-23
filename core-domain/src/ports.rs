@@ -217,6 +217,9 @@ pub trait JobRepository: Send + Sync {
     /// Devuelve a `pending` hasta `limit` documentos en contingencia sin trabajo activo y les
     /// encola una nueva transmisión. Devuelve cuántos se reprocesaron.
     async fn requeue_contingency(&self, limit: i64, max_attempts: i32) -> Result<u64, DomainError>;
+
+    /// Trabajos pendientes por estado.
+    async fn queue_depth(&self) -> Result<crate::jobs::QueueDepth, DomainError>;
 }
 
 #[async_trait]
