@@ -5,6 +5,7 @@ pub mod jobs;
 pub mod lifecycle;
 pub mod models;
 pub mod money;
+pub mod nit;
 pub mod numbering;
 pub mod ports;
 #[cfg(feature = "testing")]

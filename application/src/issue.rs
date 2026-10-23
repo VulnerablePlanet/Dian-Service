@@ -1,4 +1,4 @@
-//! Caso de uso: emisión de documentos (factura, nómina, documento soporte).
+//! Caso de uso: emisión de documentos (factura, notas crédito/débito, nómina, documento soporte).
 
 use core_domain::jobs::NewJob;
 use core_domain::models::{DocumentType, Tenant};
@@ -100,7 +100,8 @@ impl IssueService {
             .await
     }
 
-    /// El cliente propone el consecutivo y debe ser exactamente el siguiente de la resolución.
+    /// Factura o nota crédito/débito según `document_type`. El cliente propone el consecutivo
+    /// y debe ser exactamente el siguiente del rango de numeración de ese tipo y prefijo.
     pub async fn issue_invoice(
         &self,
         tenant: &Tenant,
@@ -109,7 +110,12 @@ impl IssueService {
     ) -> Result<IssueOutcome, DomainError> {
         payload.validate().map_err(validation)?;
         require_issuer(tenant, &payload.company_nit, "emisor")?;
-        self.issue(tenant, DocumentType::Invoice, &payload.prefix, Some(payload.number), &payload, idempotency_key)
+        let document_type = match payload.document_type.as_str() {
+            "credit_note" => DocumentType::CreditNote,
+            "debit_note" => DocumentType::DebitNote,
+            _ => DocumentType::Invoice,
+        };
+        self.issue(tenant, document_type, &payload.prefix, Some(payload.number), &payload, idempotency_key)
             .await
     }
 

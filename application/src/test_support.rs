@@ -62,6 +62,10 @@ pub fn invoice_payload(number: i32) -> InvoicePayload {
         technical_key: None,
         document_type: "invoice".into(),
         test_set_id: None,
+        lines: None,
+        billing_reference: None,
+        discrepancy: None,
+        software_pin: None,
     }
 }
 
@@ -99,6 +103,7 @@ pub fn support_payload() -> SupportDocumentPayload {
         total_amount: 119000.0,
         software_pin: "pin".into(),
         environment: "2".into(),
+        lines: None,
     }
 }
 

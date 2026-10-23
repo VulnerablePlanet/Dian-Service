@@ -290,6 +290,7 @@ mod tests {
     #[test]
     fn matches_libxml2_on_the_corpus() {
         if Command::new("xmllint").arg("--version").output().is_err() {
+            assert!(std::env::var_os("CI").is_none(), "xmllint is required in CI");
             eprintln!("xmllint not installed: skipping C14N differential test");
             return;
         }

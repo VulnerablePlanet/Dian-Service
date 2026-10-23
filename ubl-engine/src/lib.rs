@@ -1,13 +1,17 @@
 pub mod cufe;
 pub mod error;
+pub mod model;
 pub mod packaging;
 pub mod payload;
 pub mod templates;
 
 use cufe::{calculate_cufe_cude, calculate_cune, calculate_cuds};
 use error::UblError;
-use payload::{InvoicePayload, PayrollPayload, SupportDocumentPayload};
-use templates::TemplateEngine;
+use minijinja::context;
+use model::{compute_lines, tax_subtotals, CommercialDocument, PartyData};
+use payload::{InvoicePayload, LinePayload, PayrollPayload, SupportDocumentPayload};
+use rust_decimal::Decimal;
+use templates::engine;
 
 /// Formatea un monto con dos decimales exactos a partir de su valor decimal (no del binario
 /// aproximado del `f64`). Los montos ya fueron validados por `validate()`.
@@ -17,16 +21,76 @@ pub(crate) fn format_amount(amount: f64) -> String {
         .unwrap_or_else(|_| format!("{:.2}", amount))
 }
 
-/// Genera el XML UBL 2.1 base y calcula el CUFE para una factura.
-/// `technical_key` es la clave técnica de la resolución de numeración.
-/// Retorna una tupla con `(xml_renderizado, cufe_calculado)`.
+fn decimal_amount(field: &str, value: f64) -> Result<Decimal, UblError> {
+    core_domain::money::to_amount(field, value).map_err(|e| UblError::Validation(e.to_string()))
+}
+
+/// Datos comunes de un documento comercial (factura, nota o documento soporte).
+struct CommercialInput<'a> {
+    customization_id: &'a str,
+    type_code: &'a str,
+    uuid: String,
+    uuid_scheme: &'a str,
+    id: String,
+    issue_date: &'a str,
+    issue_time: &'a str,
+    environment: &'a str,
+    supplier: PartyData,
+    customer: PartyData,
+    lines: Option<&'a [LinePayload]>,
+    net_amount: f64,
+    tax_amount: f64,
+    total_amount: f64,
+    billing_reference: Option<payload::BillingReferencePayload>,
+    discrepancy: Option<payload::DiscrepancyPayload>,
+}
+
+fn commercial_document(input: CommercialInput<'_>) -> Result<CommercialDocument, UblError> {
+    let net = decimal_amount("net_amount", input.net_amount)?;
+    let tax = decimal_amount("tax_amount", input.tax_amount)?;
+    let total = decimal_amount("total_amount", input.total_amount)?;
+    Ok(CommercialDocument {
+        customization_id: input.customization_id.to_string(),
+        profile_execution_id: input.environment.to_string(),
+        id: input.id,
+        uuid: input.uuid,
+        uuid_scheme: input.uuid_scheme.to_string(),
+        issue_date: input.issue_date.to_string(),
+        issue_time: input.issue_time.to_string(),
+        type_code: input.type_code.to_string(),
+        supplier: input.supplier,
+        customer: input.customer,
+        lines: compute_lines(input.lines, net, tax)?,
+        tax_subtotals: tax_subtotals(input.lines, net, tax)?,
+        net: core_domain::money::format_amount(net),
+        tax: core_domain::money::format_amount(tax),
+        total: core_domain::money::format_amount(total),
+        billing_reference: input.billing_reference,
+        discrepancy: input.discrepancy,
+    })
+}
+
+/// Genera el XML UBL 2.1 sin firmar de una factura o de una nota crédito/débito y calcula su
+/// código único, según `payload.document_type`:
+/// - `invoice`: `Invoice` con CUFE (clave técnica `technical_key` de la resolución).
+/// - `credit_note` / `debit_note`: `CreditNote` / `DebitNote` con CUDE (PIN del software) y
+///   referencia a la factura que corrigen; `technical_key` no interviene.
+///
+/// Retorna `(xml, cufe_o_cude)`.
 pub fn generate_invoice_xml(payload: &InvoicePayload, technical_key: &str) -> Result<(String, String), UblError> {
-    // 1. Validar el payload localmente antes del mapeo
     payload.validate()?;
 
-    // 2. Calcular el CUFE/CUDE usando SHA-384
-    let cufe = calculate_cufe_cude(
-        &format!("{}{}", payload.prefix, payload.number),
+    let (template, customization_id, type_code, uuid_scheme, key) = match payload.document_type.as_str() {
+        "invoice" => ("invoice.xml", "10", "01", "CUFE-SHA384", technical_key),
+        "credit_note" => ("credit_note.xml", "20", "91", "CUDE-SHA384", payload.software_pin.as_deref().unwrap_or_default()),
+        "debit_note" => ("debit_note.xml", "30", "92", "CUDE-SHA384", payload.software_pin.as_deref().unwrap_or_default()),
+        other => return Err(UblError::Validation(format!("Tipo de documento no soportado: {}", other))),
+    };
+
+    // CUFE y CUDE comparten fórmula (SHA-384); cambia la clave: técnica o PIN del software.
+    let id = format!("{}{}", payload.prefix, payload.number);
+    let code = calculate_cufe_cude(
+        &id,
         &payload.issue_date,
         &payload.issue_time,
         payload.net_amount,
@@ -39,32 +103,31 @@ pub fn generate_invoice_xml(payload: &InvoicePayload, technical_key: &str) -> Re
         payload.total_amount,
         &payload.company_nit,
         &payload.customer_id,
-        technical_key,
+        key,
         &payload.environment,
     );
 
-    // 3. Renderizar plantilla XML con MiniJinja
-    let engine = TemplateEngine::new();
-    let xml = engine.render_invoice(
-        "10", // CustomizationID: "10" estándar DIAN para factura de venta
-        &payload.prefix,
-        payload.number,
-        &cufe,
-        &payload.issue_date,
-        &payload.issue_time,
-        "01", // InvoiceTypeCode: "01" factura de venta nacional
-        &payload.company_nit,
-        &payload.company_name,
-        "31", // SupplierIDType: "31" = NIT
-        &payload.customer_id,
-        &payload.customer_name,
-        &payload.customer_id_type,
-        payload.net_amount,
-        payload.tax_amount,
-        payload.total_amount,
-    )?;
+    let document = commercial_document(CommercialInput {
+        customization_id,
+        type_code,
+        uuid: code.clone(),
+        uuid_scheme,
+        id,
+        issue_date: &payload.issue_date,
+        issue_time: &payload.issue_time,
+        environment: &payload.environment,
+        supplier: PartyData::new("31", &payload.company_nit, &payload.company_name),
+        customer: PartyData::new(&payload.customer_id_type, &payload.customer_id, &payload.customer_name),
+        lines: payload.lines.as_deref(),
+        net_amount: payload.net_amount,
+        tax_amount: payload.tax_amount,
+        total_amount: payload.total_amount,
+        billing_reference: payload.billing_reference.clone(),
+        discrepancy: payload.discrepancy.clone(),
+    })?;
 
-    Ok((xml, cufe))
+    let xml = engine().render(template, context! { doc => document })?;
+    Ok((xml, code))
 }
 
 /// Genera el XML de AttachedDocument para el contenedor electrónico.
@@ -78,24 +141,21 @@ pub fn generate_attached_document_xml(
     signed_invoice_xml: &str,
     dian_response_xml: &str,
 ) -> Result<String, UblError> {
-    let engine = TemplateEngine::new();
-    let xml = engine.render_attached_document(
-        unique_id,
-        issue_date,
-        issue_time,
-        &format!("{}{}", payload.prefix, payload.number),
-        cufe,
-        &payload.issue_date,
-        &payload.company_nit,
-        &payload.company_name,
-        "31",
-        &payload.customer_id,
-        &payload.customer_name,
-        &payload.customer_id_type,
-        signed_invoice_xml,
-        dian_response_xml,
-    )?;
-    Ok(xml)
+    engine().render(
+        "attached_document.xml",
+        context! {
+            unique_id,
+            issue_date,
+            issue_time,
+            parent_document_id => format!("{}{}", payload.prefix, payload.number),
+            parent_document_uuid => cufe,
+            parent_document_issue_date => &payload.issue_date,
+            sender => PartyData::new("31", &payload.company_nit, &payload.company_name),
+            receiver => PartyData::new(&payload.customer_id_type, &payload.customer_id, &payload.customer_name),
+            signed_invoice_xml,
+            dian_response_xml,
+        },
+    )
 }
 
 /// Genera el XML de ApplicationResponse para eventos RADIAN.
@@ -117,7 +177,6 @@ pub fn generate_application_response_xml(
     software_pin: &str,
     environment: &str,
 ) -> Result<(String, String), UblError> {
-    // 1. Calcular el CUDE del evento usando SHA-384
     let cude = cufe::calculate_cude_event(
         id,
         issue_date,
@@ -128,23 +187,21 @@ pub fn generate_application_response_xml(
         environment,
     );
 
-    // 2. Renderizar plantilla XML
-    let engine = TemplateEngine::new();
-    let xml = engine.render_application_response(
-        id,
-        &cude,
-        issue_date,
-        issue_time,
-        sender_nit,
-        sender_name,
-        sender_id_type,
-        receiver_nit,
-        receiver_name,
-        receiver_id_type,
-        event_code,
-        event_description,
-        parent_document_id,
-        parent_document_uuid,
+    let xml = engine().render(
+        "application_response.xml",
+        context! {
+            id,
+            cude => &cude,
+            issue_date,
+            issue_time,
+            environment,
+            sender => PartyData::new(sender_id_type, sender_nit, sender_name),
+            receiver => PartyData::new(receiver_id_type, receiver_nit, receiver_name),
+            event_code,
+            event_description,
+            parent_document_id,
+            parent_document_uuid,
+        },
     )?;
 
     Ok((xml, cude))
@@ -169,34 +226,37 @@ pub fn generate_payroll_xml(payload: &PayrollPayload) -> Result<(String, String)
         &payload.environment,
     );
 
-    let engine = TemplateEngine::new();
-    let xml = engine.render_payroll(
-        &payload.prefix,
-        payload.number,
-        &cune,
-        &payload.issue_date,
-        &payload.issue_time,
-        &payload.employer_nit,
-        &payload.employer_name,
-        &payload.employee_id,
-        &payload.employee_name,
-        payload.devengado,
-        payload.deducido,
-        payload.total,
+    let xml = engine().render(
+        "payroll.xml",
+        context! {
+            Prefix => &payload.prefix,
+            Number => payload.number,
+            CUNE => &cune,
+            IssueDate => &payload.issue_date,
+            IssueTime => &payload.issue_time,
+            EmployerNIT => &payload.employer_nit,
+            EmployerName => &payload.employer_name,
+            EmployeeID => &payload.employee_id,
+            EmployeeName => &payload.employee_name,
+            Devengado => format_amount(payload.devengado),
+            Deducido => format_amount(payload.deducido),
+            Total => format_amount(payload.total),
+        },
     )?;
 
     Ok((xml, cune))
 }
 
-/// Genera el XML de Documento Soporte y calcula el CUDS.
+/// Genera el XML de Documento Soporte (un `Invoice` con tipo 05) y calcula el CUDS.
 pub fn generate_support_document_xml(payload: &SupportDocumentPayload) -> Result<(String, String), UblError> {
     payload.validate()?;
 
     // Codigo de impuesto por defecto IVA = "01" (con valor tax_amount) o "00" (sin impuesto)
     let cod_imp = if payload.tax_amount > 0.0 { "01" } else { "00" };
+    let id = format!("{}{}", payload.prefix, payload.number);
 
     let cuds = calculate_cuds(
-        &format!("{}{}", payload.prefix, payload.number),
+        &id,
         &payload.issue_date,
         &payload.issue_time,
         payload.net_amount,
@@ -209,26 +269,28 @@ pub fn generate_support_document_xml(payload: &SupportDocumentPayload) -> Result
         &payload.environment,
     );
 
-    let engine = TemplateEngine::new();
-    let xml = engine.render_support_document(
-        &payload.prefix,
-        payload.number,
-        &cuds,
-        &payload.issue_date,
-        &payload.issue_time,
-        &payload.seller_nit,
-        &payload.seller_name,
-        &payload.buyer_nit,
-        &payload.buyer_name,
-        payload.net_amount,
-        payload.tax_amount,
-        payload.total_amount,
-    )?;
+    let document = commercial_document(CommercialInput {
+        customization_id: "10", // vendedor residente
+        type_code: "05",
+        uuid: cuds.clone(),
+        uuid_scheme: "CUDS-SHA384",
+        id,
+        issue_date: &payload.issue_date,
+        issue_time: &payload.issue_time,
+        environment: &payload.environment,
+        supplier: PartyData::new("31", &payload.seller_nit, &payload.seller_name),
+        customer: PartyData::new("31", &payload.buyer_nit, &payload.buyer_name),
+        lines: payload.lines.as_deref(),
+        net_amount: payload.net_amount,
+        tax_amount: payload.tax_amount,
+        total_amount: payload.total_amount,
+        billing_reference: None,
+        discrepancy: None,
+    })?;
 
+    let xml = engine().render("invoice.xml", context! { doc => document })?;
     Ok((xml, cuds))
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -254,6 +316,10 @@ mod tests {
             technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
+            lines: None,
+            billing_reference: None,
+            discrepancy: None,
+            software_pin: None,
         };
 
         let result = generate_invoice_xml(&payload, "clave_tecnica_dian");
@@ -286,6 +352,10 @@ mod tests {
             technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
+            lines: None,
+            billing_reference: None,
+            discrepancy: None,
+            software_pin: None,
         };
 
         let signed_invoice = "<Invoice>signed</Invoice>";
@@ -389,6 +459,7 @@ mod tests {
             total_amount: 119000.00,
             software_pin: "pin_test".to_string(),
             environment: "2".to_string(),
+            lines: None,
         };
 
         let result = generate_support_document_xml(&sd);
@@ -396,7 +467,8 @@ mod tests {
         let (xml, cuds) = result.unwrap();
         assert_eq!(cuds.len(), 96);
         assert!(xml.contains("<Invoice"));
-        assert!(xml.contains("<cbc:CustomizationID>05</cbc:CustomizationID>"));
+        assert!(xml.contains("<cbc:InvoiceTypeCode>05</cbc:InvoiceTypeCode>"));
+        assert!(xml.contains("schemeName=\"CUDS-SHA384\""));
         assert!(xml.contains(&cuds));
         assert!(xml.contains("100000.00"));
         assert!(xml.contains("19000.00"));
@@ -422,6 +494,10 @@ mod tests {
             technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
+            lines: None,
+            billing_reference: None,
+            discrepancy: None,
+            software_pin: None,
         };
 
         let (xml, _) = generate_invoice_xml(&payload, "clave_tecnica_dian").unwrap();

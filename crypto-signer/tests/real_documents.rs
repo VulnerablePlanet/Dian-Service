@@ -37,12 +37,17 @@ fn invoice() -> InvoicePayload {
         technical_key: None,
         document_type: "invoice".into(),
         test_set_id: None,
+        lines: None,
+        billing_reference: None,
+        discrepancy: None,
+        software_pin: None,
     }
 }
 
 async fn sign_and_verify(name: &str, xml: &str) {
     let signed = sign_document(xml, &provider(), "local").await.unwrap();
     if std::process::Command::new("xmlsec1").arg("--version").output().is_err() {
+        assert!(std::env::var_os("CI").is_none(), "xmlsec1 is required in CI");
         eprintln!("xmlsec1 not installed: skipping verification of {}", name);
         return;
     }
@@ -70,6 +75,7 @@ async fn every_document_type_verifies_independently() {
         total_amount: 119000.0,
         software_pin: "pin".into(),
         environment: "2".into(),
+        lines: None,
     })
     .unwrap();
     sign_and_verify("support document", &support_xml).await;

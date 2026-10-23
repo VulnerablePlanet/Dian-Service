@@ -250,7 +250,7 @@ async fn business_errors_map_to_4xx() {
     );
 
     let mut note = invoice(1);
-    note["document_type"] = json!("credit_note");
+    note["document_type"] = json!("credit_note"); // sin billing_reference, discrepancy ni PIN
     assert_eq!(send(&app, "POST", "/api/v1/invoices", Some(note), &[AUTH]).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 
     let missing = format!("/api/v1/documents/{}", Uuid::new_v4());

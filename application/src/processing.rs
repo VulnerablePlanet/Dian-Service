@@ -274,7 +274,9 @@ impl DocumentProcessor {
     /// Devuelve el XML firmado: reutiliza el de un intento anterior o lo genera y firma.
     async fn artifacts(&self, document: &Document) -> Result<Artifacts, String> {
         let issuer_nit = match document.document_type {
-            DocumentType::Invoice => payload_with_number::<InvoicePayload>(document)?.company_nit,
+            DocumentType::Invoice | DocumentType::CreditNote | DocumentType::DebitNote => {
+                payload_with_number::<InvoicePayload>(document)?.company_nit
+            }
             DocumentType::Payroll => payload_with_number::<PayrollPayload>(document)?.employer_nit,
             DocumentType::SupportDocument => payload_with_number::<SupportDocumentPayload>(document)?.buyer_nit,
             other => return Err(format!("Document type {} is not supported yet", other)),
@@ -312,6 +314,11 @@ impl DocumentProcessor {
                 let technical_key = self.technical_key(document, &payload).await?;
                 ubl_engine::generate_invoice_xml(&payload, &technical_key)
                     .map_err(|e| format!("Invoice generation failed: {}", e))
+            }
+            // El CUDE de las notas usa el PIN del software, no la clave técnica.
+            DocumentType::CreditNote | DocumentType::DebitNote => {
+                ubl_engine::generate_invoice_xml(&payload_with_number(document)?, "")
+                    .map_err(|e| format!("Note generation failed: {}", e))
             }
             DocumentType::Payroll => ubl_engine::generate_payroll_xml(&payload_with_number(document)?)
                 .map_err(|e| format!("Payroll generation failed: {}", e)),
@@ -468,6 +475,7 @@ mod tests {
             (DocumentType::Invoice, "FE", 1),
             (DocumentType::Payroll, "NOM", 1),
             (DocumentType::SupportDocument, "DS", 5000),
+            (DocumentType::CreditNote, "NC", 1),
         ] {
             store.add_range(range(&tenant, doc_type, prefix, from));
         }
@@ -533,6 +541,39 @@ mod tests {
         assert!(h.soap.last_xml().contains("<ds:SignatureValue>fake</ds:SignatureValue>"));
         assert_eq!(h.store.events_for(id)[0].event_status, EventStatus::Accepted);
         assert_eq!(h.store.jobs_for(id)[0].status, JobStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn credit_note_is_issued_with_a_cude_and_its_invoice_reference() {
+        let h = harness();
+        let note = InvoicePayload {
+            document_type: "credit_note".into(),
+            prefix: "NC".into(),
+            number: 1,
+            billing_reference: Some(ubl_engine::payload::BillingReferencePayload {
+                number: "FE1".into(),
+                cufe: "ab".repeat(48),
+                issue_date: invoice_payload(1).issue_date,
+            }),
+            discrepancy: Some(ubl_engine::payload::DiscrepancyPayload {
+                code: "2".into(),
+                description: "Anulacion de factura".into(),
+            }),
+            software_pin: Some("pin-123".into()),
+            ..invoice_payload(1)
+        };
+        let id = h.issue_invoice(note.clone()).await;
+        let doc = h.store.document(id).unwrap();
+        assert_eq!(doc.document_type, DocumentType::CreditNote);
+
+        h.run_once().await;
+
+        let doc = h.store.document(id).unwrap();
+        assert_eq!(doc.status, DocumentStatus::DianAccepted);
+        let (_, expected_cude) = ubl_engine::generate_invoice_xml(&note, "ignored").unwrap();
+        assert_eq!(doc.cufe_cude, expected_cude);
+        let sent = h.soap.last_xml();
+        assert!(sent.contains("<CreditNote") && sent.contains("<cac:BillingReference>"));
     }
 
     #[tokio::test]

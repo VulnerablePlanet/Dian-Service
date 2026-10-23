@@ -81,6 +81,7 @@ mod tests {
     #[tokio::test]
     async fn signature_verifies_with_xmlsec1_against_the_trusted_ca() {
         if !xmlsec1_available() {
+            assert!(std::env::var_os("CI").is_none(), "xmlsec1 is required in CI");
             eprintln!("xmlsec1 not installed: skipping independent signature verification");
             return;
         }
@@ -91,6 +92,7 @@ mod tests {
     #[tokio::test]
     async fn xmlsec1_rejects_tampering_and_untrusted_signers() {
         if !xmlsec1_available() {
+            assert!(std::env::var_os("CI").is_none(), "xmlsec1 is required in CI");
             eprintln!("xmlsec1 not installed: skipping independent signature verification");
             return;
         }

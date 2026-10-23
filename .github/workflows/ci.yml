@@ -34,6 +34,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Verificadores independientes: xmlsec1 (firmas XML-DSig) y xmllint (C14N y XSD de UBL).
+      # Con CI definido, las pruebas fallan en lugar de omitirse si faltan.
+      - name: Install XML tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xmlsec1 libxml2-utils
       - name: Build
         run: cargo build --workspace --all-targets --locked
       - name: Test
