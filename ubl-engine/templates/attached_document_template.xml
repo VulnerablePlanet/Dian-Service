@@ -1,3 +1,4 @@
+{%- import "macros.xml" as m -%}
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <AttachedDocument xmlns="urn:oasis:names:specification:ubl:schema:xsd:AttachedDocument-2"
                   xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
@@ -14,66 +15,36 @@
     <cbc:UBLVersionID>UBL 2.1</cbc:UBLVersionID>
     <cbc:CustomizationID>1.0</cbc:CustomizationID>
     <cbc:ProfileID>Factura Electrónica de Venta</cbc:ProfileID>
-    <cbc:ID>{{ UniqueID }}</cbc:ID>
-    <cbc:IssueDate>{{ IssueDate }}</cbc:IssueDate>
-    <cbc:IssueTime>{{ IssueTime }}</cbc:IssueTime>
+    <cbc:ID>{{ unique_id }}</cbc:ID>
+    <cbc:IssueDate>{{ issue_date }}</cbc:IssueDate>
+    <cbc:IssueTime>{{ issue_time }}</cbc:IssueTime>
     <cbc:DocumentType>Contenedor de Factura Electrónica</cbc:DocumentType>
-    <cbc:ParentDocumentID>{{ ParentDocumentID }}</cbc:ParentDocumentID>
+    <cbc:ParentDocumentID>{{ parent_document_id }}</cbc:ParentDocumentID>
     
-    <cac:SenderParty>
-        <cbc:AdditionalAccountID>{{ SupplierIDType }}</cbc:AdditionalAccountID>
-        <cac:Party>
-            <cac:PartyName>
-                <cbc:Name>{{ SupplierName }}</cbc:Name>
-            </cac:PartyName>
-            <cac:PartyTaxScheme>
-                <cbc:RegistrationName>{{ SupplierName }}</cbc:RegistrationName>
-                <cbc:CompanyID schemeAgencyID="195" schemeAgencyName="CO, DIAN (Dirección de Impuestos y Aduanas Nacionales)" schemeID="0" schemeName="{{ SupplierIDType }}">{{ SupplierNIT }}</cbc:CompanyID>
-                <cac:TaxScheme>
-                    <cbc:ID>01</cbc:ID>
-                    <cbc:Name>IVA</cbc:Name>
-                </cac:TaxScheme>
-            </cac:PartyTaxScheme>
-        </cac:Party>
-    </cac:SenderParty>
+{{ m.plain_party("SenderParty", sender) }}
     
-    <cac:ReceiverParty>
-        <cbc:AdditionalAccountID>{{ CustomerIDType }}</cbc:AdditionalAccountID>
-        <cac:Party>
-            <cac:PartyName>
-                <cbc:Name>{{ CustomerName }}</cbc:Name>
-            </cac:PartyName>
-            <cac:PartyTaxScheme>
-                <cbc:RegistrationName>{{ CustomerName }}</cbc:RegistrationName>
-                <cbc:CompanyID schemeAgencyID="195" schemeAgencyName="CO, DIAN (Dirección de Impuestos y Aduanas Nacionales)" schemeID="0" schemeName="{{ CustomerIDType }}">{{ CustomerID }}</cbc:CompanyID>
-                <cac:TaxScheme>
-                    <cbc:ID>01</cbc:ID>
-                    <cbc:Name>IVA</cbc:Name>
-                </cac:TaxScheme>
-            </cac:PartyTaxScheme>
-        </cac:Party>
-    </cac:ReceiverParty>
+{{ m.plain_party("ReceiverParty", receiver) }}
     
     <cac:Attachment>
         <cac:ExternalReference>
             <cbc:MimeCode>text/xml</cbc:MimeCode>
             <cbc:EncodingCode>UTF-8</cbc:EncodingCode>
-            <cbc:Description><![CDATA[{{ SignedInvoiceXML }}]]></cbc:Description>
+            <cbc:Description>{{ signed_invoice_xml }}</cbc:Description>
         </cac:ExternalReference>
     </cac:Attachment>
     
     <cac:ParentDocumentLineReference>
         <cbc:LineID>1</cbc:LineID>
         <cac:DocumentReference>
-            <cbc:ID>{{ ParentDocumentID }}</cbc:ID>
-            <cbc:UUID schemeName="CO-FR">{{ ParentDocumentUUID }}</cbc:UUID>
-            <cbc:IssueDate>{{ ParentDocumentIssueDate }}</cbc:IssueDate>
+            <cbc:ID>{{ parent_document_id }}</cbc:ID>
+            <cbc:UUID schemeName="CUFE-SHA384">{{ parent_document_uuid }}</cbc:UUID>
+            <cbc:IssueDate>{{ parent_document_issue_date }}</cbc:IssueDate>
             <cbc:DocumentType>ApplicationResponse</cbc:DocumentType>
             <cac:Attachment>
                 <cac:ExternalReference>
                     <cbc:MimeCode>text/xml</cbc:MimeCode>
                     <cbc:EncodingCode>UTF-8</cbc:EncodingCode>
-                    <cbc:Description><![CDATA[{{ DianResponseXML }}]]></cbc:Description>
+                    <cbc:Description>{{ dian_response_xml }}</cbc:Description>
                 </cac:ExternalReference>
             </cac:Attachment>
         </cac:DocumentReference>

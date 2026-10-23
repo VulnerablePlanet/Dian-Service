@@ -1,0 +1,25 @@
+[package]
+name = "application"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-domain = { path = "../core-domain" }
+ubl-engine = { path = "../ubl-engine" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+quick-xml = { workspace = true }
+hmac = { workspace = true }
+url = "2"
+rand = "0.8"
+
+[dev-dependencies]
+core-domain = { path = "../core-domain", features = ["testing"] }
+zip = { workspace = true }
+crypto-signer = { path = "../crypto-signer" }

@@ -52,7 +52,7 @@ pub fn calculate_cufe_cude(
 }
 
 fn format_amount(amount: f64) -> String {
-    format!("{:.2}", amount)
+    crate::format_amount(amount)
 }
 
 pub fn calculate_cude_event(

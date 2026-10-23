@@ -1,7 +1,7 @@
 use chrono::Utc;
 use core_domain::models::{
-    Certificate, CertificateStatus, DianEvent, Document, DocumentStatus, DocumentType, EventStatus,
-    NumberingRange, Tenant, Webhook, WebhookSubscriptionStatus,
+    CertificateStatus, Direction, Document, DocumentStatus, DocumentType, EventStatus, Tenant,
+    WebhookSubscriptionStatus,
 };
 use uuid::Uuid;
 
@@ -70,9 +70,12 @@ fn test_document_serialization() {
     let document = Document {
         id: Uuid::new_v4(),
         tenant_id: Uuid::new_v4(),
+        direction: Direction::Outbound,
+        issuer_nit: String::new(),
         document_type: DocumentType::Invoice,
         prefix: "SETP".to_string(),
         document_number: 99482,
+        numbering_range_id: None,
         cufe_cude: "dian_hash_sha384_value".to_string(),
         payload: serde_json::json!({
             "items": []
