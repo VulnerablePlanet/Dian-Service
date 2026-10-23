@@ -1,0 +1,19 @@
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+core-domain = { path = "../core-domain" }
+application = { path = "../application" }
+infra-postgres = { path = "../infra-postgres" }
+crypto-signer = { path = "../crypto-signer" }
+dian-soap-client = { path = "../dian-soap-client" }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

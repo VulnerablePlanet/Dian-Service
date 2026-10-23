@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "core-domain",
+    "infra-postgres",
+    "application",
     "ubl-engine",
     "crypto-signer",
     "dian-soap-client",
-    "worker-redis",
+    "worker",
     "api-server",
 ]
 
@@ -17,6 +19,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
+rust_decimal = "1.36"
 anyhow = "1.0"
 async-trait = "0.1"
 sha2 = { version = "0.10", features = ["oid"] }
@@ -27,7 +30,6 @@ base64 = "0.22"
 ring = "0.17"
 rsa = "0.9"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 axum = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 hmac = "0.12.1"

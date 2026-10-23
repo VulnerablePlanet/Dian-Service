@@ -1,38 +1,68 @@
-use serde::{Deserialize, Serialize};
+//! Trabajos de la cola persistente (tabla `jobs`).
+//!
+//! La cola vive en la misma base de datos que los documentos: el trabajo inicial se inserta
+//! en la misma transacción que el documento, por lo que no existe un documento sin trabajo
+//! ni un trabajo sin documento.
+
+use crate::models::JobKind;
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Mensaje que viaja por la cola de documentos entre `api-server` y `worker-redis`.
-///
-/// La cola confirma (ACK) los trabajos eliminando la cadena serializada exacta de la
-/// lista de procesamiento, por lo que productor y consumidor deben serializar con este
-/// mismo tipo y con [`DocumentJob::to_payload`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DocumentJob {
+/// Trabajo reclamado por un worker. `attempts` ya incluye el intento en curso.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Job {
+    pub id: Uuid,
+    pub kind: JobKind,
     pub document_id: Uuid,
-    pub attempt: u32,
+    pub payload: Value,
+    pub attempts: i32,
+    pub max_attempts: i32,
 }
 
-impl DocumentJob {
-    pub fn new(document_id: Uuid) -> Self {
+impl Job {
+    pub fn is_last_attempt(&self) -> bool {
+        self.attempts >= self.max_attempts
+    }
+
+    /// Clave de seguimiento DIAN (`ZipKey`) de un trabajo de consulta de estado.
+    pub fn zip_key(&self) -> Option<&str> {
+        self.payload.get("zip_key").and_then(Value::as_str)
+    }
+}
+
+/// Trabajo por encolar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewJob {
+    pub id: Uuid,
+    pub kind: JobKind,
+    pub document_id: Uuid,
+    pub payload: Value,
+    pub max_attempts: i32,
+    pub run_at: DateTime<Utc>,
+}
+
+impl NewJob {
+    pub fn transmit(document_id: Uuid, max_attempts: i32) -> Self {
         Self {
+            id: Uuid::new_v4(),
+            kind: JobKind::Transmit,
             document_id,
-            attempt: 1,
+            payload: json!({}),
+            max_attempts,
+            run_at: Utc::now(),
         }
     }
 
-    pub fn retry(&self) -> Self {
+    pub fn poll_status(document_id: Uuid, zip_key: &str, max_attempts: i32, run_at: DateTime<Utc>) -> Self {
         Self {
-            document_id: self.document_id,
-            attempt: self.attempt + 1,
+            id: Uuid::new_v4(),
+            kind: JobKind::PollStatus,
+            document_id,
+            payload: json!({ "zip_key": zip_key }),
+            max_attempts,
+            run_at,
         }
-    }
-
-    pub fn to_payload(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    pub fn from_payload(payload: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(payload)
     }
 }
 
@@ -41,28 +71,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_roundtrip_is_byte_identical() {
-        let job = DocumentJob::new(Uuid::new_v4());
-        let payload = job.to_payload().unwrap();
-        let parsed = DocumentJob::from_payload(&payload).unwrap();
-        assert_eq!(parsed, job);
-        assert_eq!(parsed.to_payload().unwrap(), payload);
-    }
-
-    #[test]
-    fn payload_field_order_is_stable() {
-        let id = Uuid::nil();
-        let payload = DocumentJob { document_id: id, attempt: 3 }.to_payload().unwrap();
-        assert_eq!(
-            payload,
-            r#"{"document_id":"00000000-0000-0000-0000-000000000000","attempt":3}"#
-        );
-    }
-
-    #[test]
-    fn retry_increments_attempt() {
-        let job = DocumentJob::new(Uuid::new_v4());
-        assert_eq!(job.retry().attempt, 2);
-        assert_eq!(job.retry().document_id, job.document_id);
+    fn poll_job_carries_zip_key() {
+        let new = NewJob::poll_status(Uuid::new_v4(), "zk-1", 10, Utc::now());
+        let job = Job {
+            id: new.id,
+            kind: new.kind,
+            document_id: new.document_id,
+            payload: new.payload,
+            attempts: 1,
+            max_attempts: new.max_attempts,
+        };
+        assert_eq!(job.zip_key(), Some("zk-1"));
+        assert!(!job.is_last_attempt());
     }
 }

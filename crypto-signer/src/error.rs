@@ -25,7 +25,7 @@ impl From<CryptoError> for core_domain::ports::DomainError {
     fn from(err: CryptoError) -> Self {
         match err {
             CryptoError::C14n(msg) => core_domain::ports::DomainError::Crypto(format!("C14n: {}", msg)),
-            CryptoError::Vault(msg) => core_domain::ports::DomainError::Soap(format!("Vault: {}", msg)), // Or other suitable
+            CryptoError::Vault(msg) => core_domain::ports::DomainError::Crypto(format!("Vault: {}", msg)),
             CryptoError::Provider(msg) => core_domain::ports::DomainError::Crypto(format!("Provider: {}", msg)),
             CryptoError::Signing(msg) => core_domain::ports::DomainError::Crypto(format!("Signing: {}", msg)),
             CryptoError::Xml(msg) => core_domain::ports::DomainError::Crypto(format!("Xml: {}", msg)),

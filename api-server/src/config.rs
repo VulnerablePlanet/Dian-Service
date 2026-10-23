@@ -8,6 +8,8 @@ pub struct ApiConfig {
     /// Solo para ambientes de prueba: los documentos quedan marcados como no verificados
     /// y no admiten eventos RADIAN.
     pub inbound_allow_unverified_signatures: bool,
+    /// Intentos de transmisión de cada documento antes de pasar a contingencia.
+    pub transmit_max_attempts: i32,
 }
 
 impl ApiConfig {
@@ -19,17 +21,24 @@ impl ApiConfig {
             inbound_allow_unverified_signatures: std::env::var("INBOUND_ALLOW_UNVERIFIED_SIGNATURES")
                 .map(|v| v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            transmit_max_attempts: parsed_env("TRANSMIT_MAX_ATTEMPTS", 5)?,
         })
     }
 }
 
-fn optional_env(name: &str) -> Option<String> {
+pub fn optional_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 pub fn required_env(name: &str) -> Result<String, String> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err(format!("Missing required environment variable {}", name)),
+    optional_env(name).ok_or_else(|| format!("Missing required environment variable {}", name))
+}
+
+pub fn parsed_env<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match optional_env(name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .map_err(|_| format!("Invalid value for {}: '{}'", name, value)),
     }
 }

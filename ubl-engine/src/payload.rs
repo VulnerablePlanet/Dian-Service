@@ -1,5 +1,15 @@
 use crate::error::UblError;
+use core_domain::money::{require_equal, to_amount};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+fn amount(field: &str, value: f64) -> Result<Decimal, UblError> {
+    to_amount(field, value).map_err(|e| UblError::Validation(e.to_string()))
+}
+
+fn equal(description: &str, expected: Decimal, actual: Decimal) -> Result<(), UblError> {
+    require_equal(description, expected, actual).map_err(|e| UblError::Validation(e.to_string()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvoicePayload {
@@ -17,7 +27,10 @@ pub struct InvoicePayload {
     pub tax_amount: f64,
     pub total_amount: f64,
     pub environment: String,      // "1" = Producción, "2" = Habilitación/Pruebas
-    pub technical_key: String,    // Clave técnica (para facturas) o Software PIN (para notas)
+    /// Obsoleto: la clave técnica se toma de la resolución de numeración. Se acepta para no
+    /// romper clientes existentes, pero se ignora y nunca se persiste.
+    #[serde(default, skip_serializing)]
+    pub technical_key: Option<String>,
     pub document_type: String,    // "invoice", "credit_note", "debit_note"
     #[serde(default)]
     pub test_set_id: Option<String>,
@@ -69,11 +82,10 @@ impl InvoicePayload {
         }
 
         // 6. Validar montos positivos
-        if self.net_amount < 0.0 || self.tax_amount < 0.0 || self.total_amount < 0.0 {
-            return Err(UblError::Validation(
-                "Los montos del documento no pueden ser negativos".to_string(),
-            ));
-        }
+        let net = amount("net_amount", self.net_amount)?;
+        let tax = amount("tax_amount", self.tax_amount)?;
+        let total = amount("total_amount", self.total_amount)?;
+        equal("total_amount debe ser net_amount + tax_amount", net + tax, total)?;
 
         // 7. Validar tipo de documento
         // Las notas crédito/débito requieren su propia plantilla UBL, BillingReference y CUDE;
@@ -135,7 +147,7 @@ mod tests {
             tax_amount: 190.0,
             total_amount: 1190.0,
             environment: "2".to_string(),
-            technical_key: "clave_tecnica".to_string(),
+            technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
         }
@@ -179,6 +191,25 @@ mod tests {
         assert!(payload.validate().is_err());
         payload.test_set_id = Some(String::new());
         assert!(payload.validate().is_err());
+    }
+
+    #[test]
+    fn test_totals_must_add_up() {
+        let mut payload = mock_payload();
+        payload.total_amount = 5.0;
+        assert!(payload.validate().is_err());
+        payload.total_amount = 1190.0;
+        payload.tax_amount = 190.005;
+        assert!(payload.validate().is_err(), "more than two decimals must be rejected");
+    }
+
+    #[test]
+    fn test_legacy_technical_key_is_accepted_but_never_serialized() {
+        let mut payload = mock_payload();
+        payload.technical_key = Some("secreto".to_string());
+        assert!(payload.validate().is_ok());
+        let value = serde_json::to_value(&payload).unwrap();
+        assert!(value.get("technical_key").is_none());
     }
 
     #[test]
@@ -228,9 +259,10 @@ impl PayrollPayload {
             return Err(UblError::Validation("La identificacion del empleado no puede estar vacia".to_string()));
         }
 
-        if self.devengado < 0.0 || self.deducido < 0.0 || self.total < 0.0 {
-            return Err(UblError::Validation("Los montos de nomina no pueden ser negativos".to_string()));
-        }
+        let devengado = amount("devengado", self.devengado)?;
+        let deducido = amount("deducido", self.deducido)?;
+        let total = amount("total", self.total)?;
+        equal("total debe ser devengado - deducido", devengado - deducido, total)?;
 
         if self.environment != "1" && self.environment != "2" {
             return Err(UblError::Validation("El ambiente debe ser '1' (produccion) o '2' (habilitacion)".to_string()));
@@ -282,9 +314,10 @@ impl SupportDocumentPayload {
             return Err(UblError::Validation("El NIT del comprador debe ser numerico".to_string()));
         }
 
-        if self.net_amount < 0.0 || self.tax_amount < 0.0 || self.total_amount < 0.0 {
-            return Err(UblError::Validation("Los montos del documento soporte no pueden ser negativos".to_string()));
-        }
+        let net = amount("net_amount", self.net_amount)?;
+        let tax = amount("tax_amount", self.tax_amount)?;
+        let total = amount("total_amount", self.total_amount)?;
+        equal("total_amount debe ser net_amount + tax_amount", net + tax, total)?;
 
         if self.environment != "1" && self.environment != "2" {
             return Err(UblError::Validation("El ambiente debe ser '1' (produccion) o '2' (habilitacion)".to_string()));

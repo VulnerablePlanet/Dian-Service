@@ -3,7 +3,8 @@ use crate::provider::{CertificateProvider, LocalCertificateProvider, VaultCertif
 use crate::sign_document;
 use crate::vault::VaultClient;
 use chrono::Utc;
-use core_domain::ports::DocumentRepository;
+use async_trait::async_trait;
+use core_domain::ports::{CertificateRepository, CryptoSigner, DomainError};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -65,15 +66,15 @@ impl SignerConfig {
     /// Firma `xml` con el certificado que corresponde al tenant.
     pub async fn sign_for_tenant(
         &self,
-        repo: &dyn DocumentRepository,
+        certificates: &dyn CertificateRepository,
         tenant_id: Uuid,
         xml: &str,
     ) -> Result<String, CryptoError> {
         let key_ref = match self.mode {
             KeyMode::SharedLocal => "local".to_string(),
             KeyMode::PerTenantVault => {
-                let cert = repo
-                    .find_active_certificate_by_tenant(tenant_id)
+                let cert = certificates
+                    .find_active_certificate(tenant_id)
                     .await
                     .map_err(|e| CryptoError::Provider(format!("Certificate lookup failed: {}", e)))?
                     .ok_or_else(|| {
@@ -92,12 +93,38 @@ impl SignerConfig {
     }
 }
 
+/// Implementación del puerto `CryptoSigner`: firma con el certificado del tenant.
+pub struct TenantSigner {
+    config: SignerConfig,
+    certificates: Arc<dyn CertificateRepository>,
+}
+
+impl TenantSigner {
+    pub fn new(config: SignerConfig, certificates: Arc<dyn CertificateRepository>) -> Self {
+        Self { config, certificates }
+    }
+
+    pub fn mode(&self) -> KeyMode {
+        self.config.mode()
+    }
+}
+
+#[async_trait]
+impl CryptoSigner for TenantSigner {
+    async fn sign_for_tenant(&self, tenant_id: Uuid, xml: &str) -> Result<String, DomainError> {
+        self.config
+            .sign_for_tenant(self.certificates.as_ref(), tenant_id, xml)
+            .await
+            .map_err(DomainError::from)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
     use core_domain::models::{Certificate, CertificateStatus};
-    use core_domain::testing::InMemoryRepository;
+    use core_domain::testing::InMemoryStore;
 
     const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/test_key.pem");
     const TEST_CERT_PEM: &str = include_str!("../tests/fixtures/test_cert.pem");
@@ -127,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_tenant_mode_requires_an_active_certificate() {
-        let repo = InMemoryRepository::default();
+        let repo = InMemoryStore::default();
         let err = per_tenant_config()
             .sign_for_tenant(&repo, Uuid::new_v4(), XML)
             .await
@@ -138,8 +165,8 @@ mod tests {
     #[tokio::test]
     async fn per_tenant_mode_rejects_expired_certificate() {
         let tenant_id = Uuid::new_v4();
-        let repo = InMemoryRepository::default();
-        repo.save_certificate(&certificate(tenant_id, Duration::days(-1))).await.unwrap();
+        let repo = InMemoryStore::default();
+        repo.add_certificate(certificate(tenant_id, Duration::days(-1)));
         let err = per_tenant_config()
             .sign_for_tenant(&repo, tenant_id, XML)
             .await
@@ -148,10 +175,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_signer_implements_the_port() {
+        let tenant_id = Uuid::new_v4();
+        let repo = Arc::new(InMemoryStore::default());
+        repo.add_certificate(certificate(tenant_id, Duration::days(30)));
+        let signer: Arc<dyn CryptoSigner> = Arc::new(TenantSigner::new(per_tenant_config(), repo));
+        assert!(signer.sign_for_tenant(tenant_id, XML).await.unwrap().contains("<ds:SignatureValue>"));
+        assert!(matches!(
+            signer.sign_for_tenant(Uuid::new_v4(), XML).await,
+            Err(DomainError::Crypto(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn per_tenant_mode_signs_with_valid_certificate() {
         let tenant_id = Uuid::new_v4();
-        let repo = InMemoryRepository::default();
-        repo.save_certificate(&certificate(tenant_id, Duration::days(30))).await.unwrap();
+        let repo = InMemoryStore::default();
+        repo.add_certificate(certificate(tenant_id, Duration::days(30)));
         let signed = per_tenant_config().sign_for_tenant(&repo, tenant_id, XML).await.unwrap();
         assert!(signed.contains("<ds:SignatureValue>"));
     }

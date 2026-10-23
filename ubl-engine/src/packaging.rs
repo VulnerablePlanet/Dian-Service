@@ -1,4 +1,4 @@
-use crate::error::SoapError;
+use crate::error::UblError;
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -10,7 +10,7 @@ pub fn compress_xml_to_zip(
     nit_ofe: &str,
     prefix: &str,
     number: i32,
-) -> Result<(Vec<u8>, String), SoapError> {
+) -> Result<(Vec<u8>, String), UblError> {
     // Formato de nombre estándar DIAN: z{nit_ofe}{prefix}{consecutivo}.zip
     let file_base = format!("z{}{}{:010}", nit_ofe, prefix, number);
     let xml_filename = format!("{}.xml", file_base);
@@ -25,13 +25,13 @@ pub fn compress_xml_to_zip(
             .compression_method(zip::CompressionMethod::Deflated);
 
         zip.start_file(&xml_filename, options)
-            .map_err(|e| SoapError::Zip(format!("Failed to start ZIP file element: {}", e)))?;
+            .map_err(|e| UblError::Formatting(format!("Failed to start ZIP file element: {}", e)))?;
 
         zip.write_all(xml_content.as_bytes())
-            .map_err(|e| SoapError::Zip(format!("Failed to write XML into ZIP: {}", e)))?;
+            .map_err(|e| UblError::Formatting(format!("Failed to write XML into ZIP: {}", e)))?;
 
         zip.finish()
-            .map_err(|e| SoapError::Zip(format!("Failed to finalize ZIP archive: {}", e)))?;
+            .map_err(|e| UblError::Formatting(format!("Failed to finalize ZIP archive: {}", e)))?;
     }
 
     Ok((buf, zip_filename))

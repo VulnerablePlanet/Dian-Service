@@ -1,5 +1,6 @@
 pub mod cufe;
 pub mod error;
+pub mod packaging;
 pub mod payload;
 pub mod templates;
 
@@ -8,9 +9,18 @@ use error::UblError;
 use payload::{InvoicePayload, PayrollPayload, SupportDocumentPayload};
 use templates::TemplateEngine;
 
+/// Formatea un monto con dos decimales exactos a partir de su valor decimal (no del binario
+/// aproximado del `f64`). Los montos ya fueron validados por `validate()`.
+pub(crate) fn format_amount(amount: f64) -> String {
+    core_domain::money::to_amount("amount", amount)
+        .map(core_domain::money::format_amount)
+        .unwrap_or_else(|_| format!("{:.2}", amount))
+}
+
 /// Genera el XML UBL 2.1 base y calcula el CUFE para una factura.
+/// `technical_key` es la clave técnica de la resolución de numeración.
 /// Retorna una tupla con `(xml_renderizado, cufe_calculado)`.
-pub fn generate_invoice_xml(payload: &InvoicePayload) -> Result<(String, String), UblError> {
+pub fn generate_invoice_xml(payload: &InvoicePayload, technical_key: &str) -> Result<(String, String), UblError> {
     // 1. Validar el payload localmente antes del mapeo
     payload.validate()?;
 
@@ -29,7 +39,7 @@ pub fn generate_invoice_xml(payload: &InvoicePayload) -> Result<(String, String)
         payload.total_amount,
         &payload.company_nit,
         &payload.customer_id,
-        &payload.technical_key,
+        technical_key,
         &payload.environment,
     );
 
@@ -241,12 +251,12 @@ mod tests {
             tax_amount: 19000.00,
             total_amount: 119000.00,
             environment: "2".to_string(),
-            technical_key: "clave_tecnica_dian".to_string(),
+            technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
         };
 
-        let result = generate_invoice_xml(&payload);
+        let result = generate_invoice_xml(&payload, "clave_tecnica_dian");
         assert!(result.is_ok());
 
         let (xml, cufe) = result.unwrap();
@@ -273,7 +283,7 @@ mod tests {
             tax_amount: 19000.00,
             total_amount: 119000.00,
             environment: "2".to_string(),
-            technical_key: "clave_tecnica_dian".to_string(),
+            technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
         };
@@ -409,12 +419,12 @@ mod tests {
             tax_amount: 19000.00,
             total_amount: 119000.00,
             environment: "2".to_string(),
-            technical_key: "clave_tecnica_dian".to_string(),
+            technical_key: None,
             document_type: "invoice".to_string(),
             test_set_id: None,
         };
 
-        let (xml, _) = generate_invoice_xml(&payload).unwrap();
+        let (xml, _) = generate_invoice_xml(&payload, "clave_tecnica_dian").unwrap();
         assert!(xml.contains("A &amp; B &lt;Ltda&gt;"));
         assert!(!xml.contains("<cbc:Injected>"));
         assert!(!xml.contains("A & B <Ltda>"));

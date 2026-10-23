@@ -61,9 +61,9 @@ impl TemplateEngine {
     ) -> Result<String, UblError> {
         let tmpl = self.env.get_template("invoice.xml")?;
 
-        let net_amount_str = format!("{:.2}", net_amount);
-        let tax_amount_str = format!("{:.2}", tax_amount);
-        let total_amount_str = format!("{:.2}", total_amount);
+        let net_amount_str = crate::format_amount(net_amount);
+        let tax_amount_str = crate::format_amount(tax_amount);
+        let total_amount_str = crate::format_amount(total_amount);
 
         let rendered = tmpl.render(context! {
             CustomizationID => customization_id,
@@ -185,9 +185,9 @@ impl TemplateEngine {
     ) -> Result<String, UblError> {
         let tmpl = self.env.get_template("payroll.xml")?;
 
-        let devengado_str = format!("{:.2}", devengado);
-        let deducido_str = format!("{:.2}", deducido);
-        let total_str = format!("{:.2}", total);
+        let devengado_str = crate::format_amount(devengado);
+        let deducido_str = crate::format_amount(deducido);
+        let total_str = crate::format_amount(total);
 
         let rendered = tmpl.render(context! {
             Prefix => prefix,
@@ -225,9 +225,9 @@ impl TemplateEngine {
     ) -> Result<String, UblError> {
         let tmpl = self.env.get_template("support_document.xml")?;
 
-        let net_amount_str = format!("{:.2}", net_amount);
-        let tax_amount_str = format!("{:.2}", tax_amount);
-        let total_amount_str = format!("{:.2}", total_amount);
+        let net_amount_str = crate::format_amount(net_amount);
+        let tax_amount_str = crate::format_amount(tax_amount);
+        let total_amount_str = crate::format_amount(total_amount);
 
         let rendered = tmpl.render(context! {
             Prefix => prefix,
