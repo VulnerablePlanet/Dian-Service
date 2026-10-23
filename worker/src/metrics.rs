@@ -2,6 +2,7 @@
 //! de la cola y estado de los circuit breakers de la DIAN.
 
 use application::resilience::{BreakerState, Breakers};
+use application::webhooks::DispatchStats;
 use core_domain::jobs::QueueDepth;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -32,8 +33,14 @@ pub struct EnvironmentLabel {
     pub environment: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OutcomeLabel {
+    pub outcome: String,
+}
+
 #[derive(Clone)]
 pub struct WorkerMetrics {
+    webhooks: Family<OutcomeLabel, Counter>,
     jobs: Family<JobLabels, Counter>,
     duration: Family<KindLabel, Histogram>,
     pub in_flight: Gauge,
@@ -44,6 +51,7 @@ pub struct WorkerMetrics {
 impl Default for WorkerMetrics {
     fn default() -> Self {
         Self {
+            webhooks: Family::default(),
             jobs: Family::default(),
             // 50 ms .. ~100 s
             duration: Family::new_with_constructor(|| Histogram::new(exponential_buckets(0.05, 2.0, 12))),
@@ -57,6 +65,11 @@ impl Default for WorkerMetrics {
 impl WorkerMetrics {
     pub fn register(&self, registry: &mut Registry) {
         registry.register("jobs", "Jobs processed by kind and outcome", self.jobs.clone());
+        registry.register(
+            "webhook_deliveries",
+            "Webhook delivery attempts by outcome (delivered, retried, dead)",
+            self.webhooks.clone(),
+        );
         registry.register("job_duration_seconds", "Job processing time", self.duration.clone());
         registry.register("jobs_in_flight", "Jobs being processed by this worker", self.in_flight.clone());
         registry.register("queue_jobs", "Pending jobs by state (ready, scheduled, running, dead)", self.queue.clone());
@@ -72,6 +85,16 @@ impl WorkerMetrics {
             .get_or_create(&JobLabels { kind: kind.to_string(), outcome: outcome.to_string() })
             .inc();
         self.duration.get_or_create(&KindLabel { kind: kind.to_string() }).observe(seconds);
+    }
+
+    pub fn webhooks_dispatched(&self, stats: DispatchStats) {
+        for (outcome, count) in [("delivered", stats.delivered), ("retried", stats.retried), ("dead", stats.dead)] {
+            if count > 0 {
+                self.webhooks
+                    .get_or_create(&OutcomeLabel { outcome: outcome.to_string() })
+                    .inc_by(count as u64);
+            }
+        }
     }
 
     pub fn set_queue_depth(&self, depth: QueueDepth) {
@@ -113,6 +136,7 @@ mod tests {
         let breakers = Breakers::new(1, Duration::from_secs(60));
         breakers.produccion.record_failure().await;
         metrics.sample_breakers(&breakers).await;
+        metrics.webhooks_dispatched(DispatchStats { claimed: 3, delivered: 2, retried: 1, dead: 0 });
 
         let mut text = String::new();
         encode(&mut text, &registry).unwrap();
@@ -123,6 +147,7 @@ mod tests {
             r#"dian_worker_queue_jobs{state="ready"} 4"#,
             r#"dian_worker_dian_breaker_open{environment="produccion"} 1"#,
             r#"dian_worker_dian_breaker_open{environment="habilitacion"} 0"#,
+            r#"dian_worker_webhook_deliveries_total{outcome="delivered"} 2"#,
         ] {
             assert!(text.contains(expected), "missing {}\n{}", expected, text);
         }

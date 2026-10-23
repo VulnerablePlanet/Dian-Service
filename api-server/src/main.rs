@@ -4,6 +4,7 @@ use api_server::metrics::HttpMetrics;
 use application::inbound::{InboundService, InboundVerification};
 use application::issue::IssueService;
 use application::radian::RadianService;
+use application::webhooks::WebhookService;
 use crypto_signer::signer::{SignerConfig, TenantSigner};
 use crypto_signer::verify::XmlSignatureVerifier;
 use dian_soap_client::client::DianSoapClientImpl;
@@ -69,6 +70,7 @@ async fn main() {
         issue: IssueService::new(store.clone(), config.transmit_max_attempts),
         inbound: InboundService::new(store.clone(), inbound_verification),
         radian: RadianService::new(store.clone(), signer, soap),
+        webhooks: WebhookService::new(store.clone(), config.webhook_policy),
         config,
         metrics,
     });

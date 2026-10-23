@@ -7,14 +7,15 @@
 use crate::jobs::{Job, NewJob};
 use crate::models::{
     Certificate, CertificateStatus, DianEvent, Direction, Document, DocumentStatus, JobKind,
-    JobStatus, NumberingRange, Tenant,
+    JobStatus, NumberingRange, Tenant, Webhook, WebhookSubscriptionStatus,
 };
 use crate::numbering::next_number;
 use crate::ports::{
     CertificateRepository, DocumentRepository, DomainError, HealthProbe, IssueOutcome,
     IssuedDocument, JobOutcome, JobRepository, NewInboundDocument, NewOutboundDocument,
-    TenantRepository, Transition,
+    TenantRepository, Transition, WebhookDelivery, WebhookRepository,
 };
+use crate::webhooks::{event_for, notification_data, NotifiedDocument, EVENT_ALL, MAX_DELIVERY_ATTEMPTS};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -37,6 +38,25 @@ pub struct StoredJob {
     pub last_error: Option<String>,
 }
 
+/// Estado de una entrega de webhook, visible para las aserciones de las pruebas.
+#[derive(Debug, Clone)]
+pub struct StoredDelivery {
+    pub id: Uuid,
+    pub webhook_id: Uuid,
+    pub document_id: Uuid,
+    pub event_type: String,
+    pub data: serde_json::Value,
+    /// `queued`, `running`, `delivered` o `dead`.
+    pub status: &'static str,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub run_at: DateTime<Utc>,
+    pub locked_until: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub last_status_code: Option<u16>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 struct State {
     tenants: Vec<Tenant>,
@@ -46,6 +66,8 @@ struct State {
     events: Vec<DianEvent>,
     jobs: HashMap<Uuid, StoredJob>,
     idempotency: HashMap<(Uuid, String), (String, IssuedDocument)>,
+    webhooks: Vec<Webhook>,
+    deliveries: HashMap<Uuid, StoredDelivery>,
 }
 
 impl State {
@@ -147,6 +169,22 @@ impl InMemoryStore {
             .collect();
         jobs.sort_by_key(|j| j.run_at);
         jobs
+    }
+
+    pub fn deliveries(&self) -> Vec<StoredDelivery> {
+        let mut deliveries: Vec<StoredDelivery> = self.state.lock().unwrap().deliveries.values().cloned().collect();
+        deliveries.sort_by_key(|d| d.created_at);
+        deliveries
+    }
+
+    /// Hace que todas las entregas en cola estén listas ya.
+    pub fn make_deliveries_due(&self) {
+        let now = Utc::now();
+        for delivery in self.state.lock().unwrap().deliveries.values_mut() {
+            if delivery.status == "queued" {
+                delivery.run_at = now;
+            }
+        }
     }
 
     /// Hace que todos los trabajos en cola estén listos ya (simula el paso del tiempo).
@@ -361,6 +399,48 @@ impl DocumentRepository for InMemoryStore {
             return Ok(false);
         }
         state.documents.get_mut(&transition.document_id).unwrap().status = transition.to;
+        if let Some(event_type) = event_for(transition.to) {
+            let document = state.documents[&transition.document_id].clone();
+            let data = notification_data(&NotifiedDocument {
+                document_id: document.id,
+                document_type: document.document_type.as_str(),
+                prefix: &document.prefix,
+                number: document.document_number,
+                status: transition.to,
+                cufe: Some(document.cufe_cude.as_str()),
+            });
+            let targets: Vec<Uuid> = state
+                .webhooks
+                .iter()
+                .filter(|w| {
+                    w.tenant_id == document.tenant_id
+                        && w.subscription_status == WebhookSubscriptionStatus::Active
+                        && (w.event_type == event_type || w.event_type == EVENT_ALL)
+                })
+                .map(|w| w.id)
+                .collect();
+            for webhook_id in targets {
+                let id = Uuid::new_v4();
+                state.deliveries.insert(
+                    id,
+                    StoredDelivery {
+                        id,
+                        webhook_id,
+                        document_id: document.id,
+                        event_type: event_type.to_string(),
+                        data: data.clone(),
+                        status: "queued",
+                        attempts: 0,
+                        max_attempts: MAX_DELIVERY_ATTEMPTS,
+                        run_at: Utc::now(),
+                        locked_until: None,
+                        last_error: None,
+                        last_status_code: None,
+                        created_at: Utc::now(),
+                    },
+                );
+            }
+        }
         if let Some(event) = transition.event {
             state.events.push(event);
         }
@@ -482,6 +562,126 @@ impl JobRepository for InMemoryStore {
             }
         }
         Ok(depth)
+    }
+}
+
+#[async_trait]
+impl WebhookRepository for InMemoryStore {
+    async fn create_webhook(&self, webhook: Webhook) -> Result<(), DomainError> {
+        self.state.lock().unwrap().webhooks.push(webhook);
+        Ok(())
+    }
+
+    async fn list_webhooks(&self, tenant_id: Uuid) -> Result<Vec<Webhook>, DomainError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .webhooks
+            .iter()
+            .filter(|w| w.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete_webhook(&self, tenant_id: Uuid, webhook_id: Uuid) -> Result<bool, DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.webhooks.len();
+        state.webhooks.retain(|w| !(w.id == webhook_id && w.tenant_id == tenant_id));
+        let deleted = state.webhooks.len() < before;
+        if deleted {
+            state.deliveries.retain(|_, d| d.webhook_id != webhook_id);
+        }
+        Ok(deleted)
+    }
+
+    async fn claim_deliveries(&self, limit: i64, lease: Duration) -> Result<Vec<WebhookDelivery>, DomainError> {
+        let now = Utc::now();
+        let mut state = self.state.lock().unwrap();
+        let mut ready: Vec<Uuid> = state
+            .deliveries
+            .values()
+            .filter(|d| {
+                (d.status == "queued" && d.run_at <= now)
+                    || (d.status == "running" && d.locked_until.is_some_and(|t| t < now))
+            })
+            .map(|d| d.id)
+            .collect();
+        ready.sort_by_key(|id| state.deliveries[id].run_at);
+        ready.truncate(limit.max(0) as usize);
+        let lease = chrono::Duration::from_std(lease).map_err(|e| DomainError::Internal(e.to_string()))?;
+        let mut claimed = Vec::new();
+        for id in ready {
+            let delivery = state.deliveries.get_mut(&id).unwrap();
+            delivery.status = "running";
+            delivery.attempts += 1;
+            delivery.locked_until = Some(now + lease);
+            let delivery = delivery.clone();
+            let webhook = state
+                .webhooks
+                .iter()
+                .find(|w| w.id == delivery.webhook_id)
+                .cloned()
+                .ok_or_else(|| DomainError::Internal("delivery without webhook".to_string()))?;
+            claimed.push(WebhookDelivery {
+                id,
+                tenant_id: webhook.tenant_id,
+                event_type: delivery.event_type,
+                data: delivery.data,
+                attempts: delivery.attempts,
+                max_attempts: delivery.max_attempts,
+                created_at: delivery.created_at,
+                target_url: webhook.target_url,
+                secret: webhook.webhook_secret,
+                active: webhook.subscription_status == WebhookSubscriptionStatus::Active,
+            });
+        }
+        Ok(claimed)
+    }
+
+    async fn complete_delivery(&self, delivery_id: Uuid, status_code: u16) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let delivery = state
+            .deliveries
+            .get_mut(&delivery_id)
+            .ok_or_else(|| DomainError::NotFound(format!("delivery {}", delivery_id)))?;
+        delivery.status = "delivered";
+        delivery.locked_until = None;
+        delivery.last_status_code = Some(status_code);
+        Ok(())
+    }
+
+    async fn retry_delivery(
+        &self,
+        delivery_id: Uuid,
+        run_at: DateTime<Utc>,
+        error: &str,
+        status_code: Option<u16>,
+    ) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let delivery = state
+            .deliveries
+            .get_mut(&delivery_id)
+            .ok_or_else(|| DomainError::NotFound(format!("delivery {}", delivery_id)))?;
+        delivery.status = "queued";
+        delivery.run_at = run_at;
+        delivery.locked_until = None;
+        delivery.last_error = Some(error.to_string());
+        delivery.last_status_code = status_code;
+        Ok(())
+    }
+
+    async fn bury_delivery(&self, delivery_id: Uuid, error: &str, status_code: Option<u16>) -> Result<(), DomainError> {
+        let mut state = self.state.lock().unwrap();
+        let delivery = state
+            .deliveries
+            .get_mut(&delivery_id)
+            .ok_or_else(|| DomainError::NotFound(format!("delivery {}", delivery_id)))?;
+        delivery.status = "dead";
+        delivery.locked_until = None;
+        delivery.last_error = Some(error.to_string());
+        delivery.last_status_code = status_code;
+        Ok(())
     }
 }
 

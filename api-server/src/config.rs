@@ -16,6 +16,9 @@ pub struct ApiConfig {
     pub inbound_intermediates_pem: Option<String>,
     /// Texto que debe contener el sujeto del certificado que firma el ApplicationResponse.
     pub inbound_dian_signer_subject: String,
+    /// Destinos de webhooks admitidos (`WEBHOOK_ALLOW_HTTP`, `WEBHOOK_ALLOW_PRIVATE_NETWORKS`;
+    /// solo desarrollo).
+    pub webhook_policy: application::webhooks::DestinationPolicy,
 }
 
 impl ApiConfig {
@@ -32,8 +35,16 @@ impl ApiConfig {
             // NIT de la DIAN; confirmar contra el certificado de un ApplicationResponse real.
             inbound_dian_signer_subject: optional_env("INBOUND_DIAN_SIGNER_SUBJECT")
                 .unwrap_or_else(|| "800197268".to_string()),
+            webhook_policy: application::webhooks::DestinationPolicy {
+                allow_http: flag_env("WEBHOOK_ALLOW_HTTP"),
+                allow_private_networks: flag_env("WEBHOOK_ALLOW_PRIVATE_NETWORKS"),
+            },
         })
     }
+}
+
+fn flag_env(name: &str) -> bool {
+    optional_env(name).is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 pub fn optional_env(name: &str) -> Option<String> {

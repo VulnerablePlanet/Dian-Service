@@ -6,6 +6,7 @@ use api_server::state::AppState;
 use application::inbound::InboundService;
 use application::issue::IssueService;
 use application::radian::RadianService;
+use application::webhooks::{DestinationPolicy, WebhookService};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -142,6 +143,7 @@ fn config() -> ApiConfig {
         inbound_trusted_ca_pem: None,
         inbound_intermediates_pem: None,
         inbound_dian_signer_subject: "800197268".into(),
+        webhook_policy: DestinationPolicy::default(),
     }
 }
 
@@ -156,12 +158,13 @@ fn app_with_metrics(
     metrics: Arc<HttpMetrics>,
 ) -> axum::Router {
     api_server::router(Arc::new(AppState {
-        tenants: store,
+        tenants: store.clone(),
         documents: documents.clone(),
         health,
         issue: IssueService::new(documents.clone(), 5),
         inbound: InboundService::new(documents.clone(), None),
         radian: RadianService::new(documents, Arc::new(NoSigner), Arc::new(NoSoap)),
+        webhooks: WebhookService::new(store.clone(), DestinationPolicy::default()),
         config: config(),
         metrics,
     }))
@@ -360,4 +363,28 @@ async fn responses_carry_request_id_and_are_not_cacheable() {
     assert_eq!(generated.headers()["cache-control"], "no-store");
     let propagated = app.clone().oneshot(request(Some("erp-req-42"))).await.unwrap();
     assert_eq!(propagated.headers()["x-request-id"], "erp-req-42");
+}
+
+#[tokio::test]
+async fn tenants_manage_their_webhook_subscriptions() {
+    let (app, _) = app();
+    let body = json!({ "target_url": "https://erp.example.com/hooks/dian", "event_type": "document.accepted" });
+    let (status, _, created) = send(&app, "POST", "/api/v1/webhooks", Some(body), &[AUTH]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let secret = created["secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("whsec_"));
+
+    let (status, _, listed) = send(&app, "GET", "/api/v1/webhooks", None, &[AUTH]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["webhooks"].as_array().unwrap().len(), 1);
+    assert!(!listed.to_string().contains(&secret), "the secret is shown only once");
+
+    let internal = json!({ "target_url": "https://169.254.169.254/latest", "event_type": "*" });
+    assert_eq!(send(&app, "POST", "/api/v1/webhooks", Some(internal), &[AUTH]).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let anonymous = json!({ "target_url": "https://erp.example.com/h", "event_type": "*" });
+    assert_eq!(send(&app, "POST", "/api/v1/webhooks", Some(anonymous), &[]).await.0, StatusCode::UNAUTHORIZED);
+
+    let uri = format!("/api/v1/webhooks/{}", created["id"].as_str().unwrap());
+    assert_eq!(send(&app, "DELETE", &uri, None, &[AUTH]).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(send(&app, "DELETE", &uri, None, &[AUTH]).await.0, StatusCode::NOT_FOUND);
 }

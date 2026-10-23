@@ -9,9 +9,11 @@
 //! - Logs JSON con un span por trabajo; `/livez`, `/readyz` y `/metrics` en `METRICS_ADDR`.
 
 mod metrics;
+mod webhook_http;
 
 use application::processing::{DocumentProcessor, ProcessorConfig};
 use application::resilience::Breakers;
+use application::webhooks::{DispatchConfig, WebhookDispatcher};
 use core_domain::ports::JobRepository;
 use crypto_signer::signer::{SignerConfig, TenantSigner};
 use dian_soap_client::client::DianSoapClientImpl;
@@ -40,7 +42,12 @@ struct WorkerConfig {
     breaker_threshold: u32,
     breaker_cooldown: Duration,
     metrics_addr: Option<SocketAddr>,
+    webhooks: webhook_http::HttpWebhookSender,
     processor: ProcessorConfig,
+}
+
+fn flag_env(name: &str) -> bool {
+    optional_env(name).is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -95,6 +102,11 @@ impl WorkerConfig {
             metrics_addr: match optional_env("METRICS_ADDR").as_deref().unwrap_or("0.0.0.0:9091") {
                 "off" => None,
                 value => Some(value.parse().map_err(|_| format!("Invalid METRICS_ADDR '{}'", value))?),
+            },
+            // Solo desarrollo: entregar webhooks por http:// o a redes privadas.
+            webhooks: webhook_http::HttpWebhookSender {
+                allow_http: flag_env("WEBHOOK_ALLOW_HTTP"),
+                allow_private_networks: flag_env("WEBHOOK_ALLOW_PRIVATE_NETWORKS"),
             },
             processor: ProcessorConfig {
                 transmit_max_attempts: parsed_env("TRANSMIT_MAX_ATTEMPTS", 5)?,
@@ -163,6 +175,12 @@ async fn main() {
         });
     }
     tokio::spawn(sampler(store.clone(), breakers, metrics.clone(), shutdown_rx.clone()));
+    let dispatcher = Arc::new(WebhookDispatcher::new(
+        store.clone(),
+        Arc::new(config.webhooks),
+        DispatchConfig::default(),
+    ));
+    let webhooks = tokio::spawn(webhook_loop(dispatcher, metrics.clone(), config.poll_interval, shutdown_rx.clone()));
 
     tokio::spawn(contingency_reconciler(
         processor.clone(),
@@ -187,6 +205,35 @@ async fn main() {
         info!("Worker detenido sin trabajos pendientes");
     } else {
         warn!("Trabajos aun en curso al vencer SHUTDOWN_GRACE_SECS; se retomaran al vencer su lease");
+    }
+    // Una entrega interrumpida se reenvía al vencer su lease (el receptor deduplica por id).
+    if tokio::time::timeout(Duration::from_secs(15), webhooks).await.is_err() {
+        warn!("Entregas de webhooks aun en curso al apagar; se reenviaran al vencer su lease");
+    }
+}
+
+/// Entrega las notificaciones pendientes. Si una pasada llena el lote, sigue sin esperar.
+async fn webhook_loop(
+    dispatcher: Arc<WebhookDispatcher>,
+    metrics: Arc<WorkerMetrics>,
+    poll_interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    const BATCH: i64 = 20;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match dispatcher.run_once(BATCH).await {
+            Ok(stats) => {
+                metrics.webhooks_dispatched(stats);
+                if stats.claimed as i64 == BATCH {
+                    continue;
+                }
+            }
+            Err(e) => error!(error = %e, "webhook dispatch failed"),
+        }
+        idle(poll_interval, &mut shutdown).await;
     }
 }
 

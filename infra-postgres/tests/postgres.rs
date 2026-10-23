@@ -9,8 +9,9 @@ use core_domain::jobs::NewJob;
 use core_domain::models::{DianEvent, DocumentStatus, DocumentType, EventStatus, JobKind};
 use core_domain::ports::{
     DocumentRepository, DomainError, IdempotencyKey, IssueOutcome, JobOutcome, JobRepository,
-    NewInboundDocument, NewOutboundDocument, Transition,
+    NewInboundDocument, NewOutboundDocument, Transition, WebhookRepository,
 };
+use core_domain::models::{Webhook, WebhookSubscriptionStatus};
 use infra_postgres::{PgStore, MIGRATOR};
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -373,6 +374,51 @@ async fn queue_depth_counts_jobs_by_state() {
 
     store.retry(claimed[0].id, Utc::now() + ChronoDuration::minutes(5), "later").await.unwrap();
     assert_eq!(store.queue_depth().await.unwrap().scheduled, 1);
+}
+
+#[tokio::test]
+async fn final_transitions_enqueue_webhook_deliveries_atomically() {
+    let Some(f) = fixture().await else { return };
+    f.add_range(DocumentType::Invoice, "FE", 1, 1000).await;
+    let store = f.store.clone();
+    let webhook = |event: &str| Webhook {
+        id: Uuid::new_v4(),
+        tenant_id: f.tenant_id,
+        target_url: "https://erp.example.com/h".into(),
+        webhook_secret: "whsec_test".into(),
+        event_type: event.into(),
+        subscription_status: WebhookSubscriptionStatus::Active,
+    };
+    let accepted_only = webhook("document.accepted");
+    store.create_webhook(accepted_only.clone()).await.unwrap();
+    store.create_webhook(webhook("*")).await.unwrap();
+    store.create_webhook(webhook("document.rejected")).await.unwrap();
+    assert!(store.create_webhook(webhook("document.created")).await.is_err(), "event type is checked by the database");
+    assert_eq!(store.list_webhooks(f.tenant_id).await.unwrap().len(), 3);
+
+    let (doc_id, _) = created(f.issue("FE", None).await.unwrap());
+    store.apply_transition(Transition::new(doc_id, DocumentStatus::SentDian)).await.unwrap();
+    assert!(store.claim_deliveries(10, Duration::from_secs(60)).await.unwrap().is_empty());
+
+    // Una transición rechazada (estado de origen inválido) no encola nada.
+    assert!(!store.apply_transition(Transition::new(doc_id, DocumentStatus::Pending)).await.unwrap());
+    store.apply_transition(Transition::new(doc_id, DocumentStatus::DianAccepted)).await.unwrap();
+
+    let claimed = store.claim_deliveries(10, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(claimed.len(), 2, "accepted-only and wildcard subscriptions");
+    assert!(claimed.iter().all(|d| d.event_type == "document.accepted" && d.attempts == 1 && d.active));
+    assert_eq!(claimed[0].data["document_id"], doc_id.to_string());
+    assert!(store.claim_deliveries(10, Duration::from_secs(60)).await.unwrap().is_empty(), "claims are exclusive");
+
+    store.complete_delivery(claimed[0].id, 204).await.unwrap();
+    store.retry_delivery(claimed[1].id, Utc::now() - ChronoDuration::seconds(1), "HTTP 500", Some(500)).await.unwrap();
+    let again = store.claim_deliveries(10, Duration::from_secs(60)).await.unwrap();
+    assert_eq!((again.len(), again[0].attempts), (1, 2));
+    store.bury_delivery(again[0].id, "gave up", None).await.unwrap();
+    assert!(store.claim_deliveries(10, Duration::from_secs(60)).await.unwrap().is_empty());
+
+    assert!(store.delete_webhook(f.tenant_id, accepted_only.id).await.unwrap());
+    assert!(!store.delete_webhook(Uuid::new_v4(), accepted_only.id).await.unwrap());
 }
 
 #[tokio::test]

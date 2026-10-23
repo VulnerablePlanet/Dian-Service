@@ -8,14 +8,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use core_domain::jobs::{Job, NewJob, QueueDepth};
 use core_domain::models::{
-    Certificate, DianEvent, Document, DocumentStatus, NumberingRange, Tenant,
+    Certificate, DianEvent, Document, DocumentStatus, NumberingRange, Tenant, Webhook,
 };
 use core_domain::numbering::next_number;
 use core_domain::ports::{
     CertificateRepository, DocumentRepository, DomainError, HealthProbe, IdempotencyKey,
     IssueOutcome, IssuedDocument, JobOutcome, JobRepository, NewInboundDocument,
-    NewOutboundDocument, TenantRepository, Transition,
+    NewOutboundDocument, TenantRepository, Transition, WebhookDelivery, WebhookRepository,
 };
+use core_domain::webhooks::{event_for, notification_data, NotifiedDocument, MAX_DELIVERY_ATTEMPTS};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use std::str::FromStr;
@@ -487,7 +488,7 @@ impl DocumentRepository for PgStore {
         let updated = sqlx::query(
             "UPDATE documents SET status = $2::document_status
              WHERE id = $1 AND status::text = ANY($3)
-             RETURNING id",
+             RETURNING tenant_id, document_type::text AS document_type, prefix, document_number, cufe_cude",
         )
         .bind(transition.document_id)
         .bind(transition.to.as_str())
@@ -496,9 +497,37 @@ impl DocumentRepository for PgStore {
         .await
         .map_err(db)?;
 
-        if updated.is_none() {
+        let Some(document) = updated else {
             tx.rollback().await.map_err(db)?;
             return Ok(false);
+        };
+
+        // Outbox: las notificaciones del cambio de estado se encolan en la misma transacción.
+        if let Some(event_type) = event_for(transition.to) {
+            let document_type: String = document.try_get("document_type").map_err(db)?;
+            let prefix: String = document.try_get("prefix").map_err(db)?;
+            let cufe: Option<String> = document.try_get("cufe_cude").map_err(db)?;
+            let data = notification_data(&NotifiedDocument {
+                document_id: transition.document_id,
+                document_type: &document_type,
+                prefix: &prefix,
+                number: document.try_get("document_number").map_err(db)?,
+                status: transition.to,
+                cufe: cufe.as_deref(),
+            });
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (id, webhook_id, document_id, event_type, data, max_attempts)
+                 SELECT gen_random_uuid(), w.id, $1, $2, $3, $4 FROM webhooks w
+                 WHERE w.tenant_id = $5 AND w.subscription_status = 'active' AND w.event_type IN ($2, '*')",
+            )
+            .bind(transition.document_id)
+            .bind(event_type)
+            .bind(&data)
+            .bind(MAX_DELIVERY_ATTEMPTS)
+            .bind(document.try_get::<Uuid, _>("tenant_id").map_err(db)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         }
 
         if let Some(event) = &transition.event {
@@ -660,6 +689,152 @@ impl JobRepository for PgStore {
         .await
         .map_err(db)?;
         Ok(QueueDepth { ready, scheduled, running, dead })
+    }
+}
+
+fn webhook_from_row(row: &PgRow) -> Result<Webhook, DomainError> {
+    Ok(Webhook {
+        id: row.try_get("id").map_err(db)?,
+        tenant_id: row.try_get("tenant_id").map_err(db)?,
+        target_url: row.try_get("target_url").map_err(db)?,
+        webhook_secret: row.try_get("webhook_secret").map_err(db)?,
+        event_type: row.try_get("event_type").map_err(db)?,
+        subscription_status: parse(row, "subscription_status")?,
+    })
+}
+
+#[async_trait]
+impl WebhookRepository for PgStore {
+    async fn create_webhook(&self, webhook: Webhook) -> Result<(), DomainError> {
+        sqlx::query(
+            "INSERT INTO webhooks (id, tenant_id, target_url, webhook_secret, event_type, subscription_status)
+             VALUES ($1, $2, $3, $4, $5, $6::subscription_status)",
+        )
+        .bind(webhook.id)
+        .bind(webhook.tenant_id)
+        .bind(&webhook.target_url)
+        .bind(&webhook.webhook_secret)
+        .bind(&webhook.event_type)
+        .bind(webhook.subscription_status.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn list_webhooks(&self, tenant_id: Uuid) -> Result<Vec<Webhook>, DomainError> {
+        sqlx::query(
+            "SELECT id, tenant_id, target_url, webhook_secret, event_type, subscription_status::text AS subscription_status
+             FROM webhooks WHERE tenant_id = $1 ORDER BY id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?
+        .iter()
+        .map(webhook_from_row)
+        .collect()
+    }
+
+    async fn delete_webhook(&self, tenant_id: Uuid, webhook_id: Uuid) -> Result<bool, DomainError> {
+        let result = sqlx::query("DELETE FROM webhooks WHERE id = $1 AND tenant_id = $2")
+            .bind(webhook_id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn claim_deliveries(&self, limit: i64, lease: Duration) -> Result<Vec<WebhookDelivery>, DomainError> {
+        let rows = sqlx::query(
+            "WITH candidates AS (
+                 SELECT id FROM webhook_deliveries
+                 WHERE (status = 'queued' AND run_at <= now())
+                    OR (status = 'running' AND locked_until < now())
+                 ORDER BY run_at
+                 LIMIT $1
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE webhook_deliveries d
+             SET status = 'running', attempts = d.attempts + 1,
+                 locked_until = now() + make_interval(secs => $2)
+             FROM candidates c, webhooks w
+             WHERE d.id = c.id AND w.id = d.webhook_id
+             RETURNING d.id, w.tenant_id, d.event_type, d.data, d.attempts, d.max_attempts, d.created_at,
+                       w.target_url, w.webhook_secret, w.subscription_status = 'active' AS active",
+        )
+        .bind(limit)
+        .bind(lease.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                Ok(WebhookDelivery {
+                    id: row.try_get("id").map_err(db)?,
+                    tenant_id: row.try_get("tenant_id").map_err(db)?,
+                    event_type: row.try_get("event_type").map_err(db)?,
+                    data: row.try_get("data").map_err(db)?,
+                    attempts: row.try_get("attempts").map_err(db)?,
+                    max_attempts: row.try_get("max_attempts").map_err(db)?,
+                    created_at: row.try_get("created_at").map_err(db)?,
+                    target_url: row.try_get("target_url").map_err(db)?,
+                    secret: row.try_get("webhook_secret").map_err(db)?,
+                    active: row.try_get("active").map_err(db)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn complete_delivery(&self, delivery_id: Uuid, status_code: u16) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'delivered', locked_until = NULL, last_status_code = $2
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(i32::from(status_code))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn retry_delivery(
+        &self,
+        delivery_id: Uuid,
+        run_at: DateTime<Utc>,
+        error: &str,
+        status_code: Option<u16>,
+    ) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries
+             SET status = 'queued', run_at = $2, locked_until = NULL, last_error = $3, last_status_code = $4
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(run_at)
+        .bind(error)
+        .bind(status_code.map(i32::from))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn bury_delivery(&self, delivery_id: Uuid, error: &str, status_code: Option<u16>) -> Result<(), DomainError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries
+             SET status = 'dead', locked_until = NULL, last_error = $2, last_status_code = $3
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(error)
+        .bind(status_code.map(i32::from))
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(())
     }
 }
 

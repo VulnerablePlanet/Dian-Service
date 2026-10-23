@@ -38,7 +38,6 @@ dependencies = [
  "core-domain",
  "crypto-signer",
  "dian-soap-client",
- "hmac",
  "http-body-util",
  "infra-postgres",
  "observability",
@@ -46,7 +45,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -66,6 +64,7 @@ dependencies = [
  "chrono",
  "core-domain",
  "crypto-signer",
+ "hmac",
  "quick-xml",
  "rand 0.8.8",
  "serde",
@@ -74,6 +73,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ubl-engine",
+ "url",
  "uuid",
  "zip",
 ]
@@ -3149,6 +3149,7 @@ name = "worker"
 version = "0.1.0"
 dependencies = [
  "application",
+ "async-trait",
  "axum",
  "core-domain",
  "crypto-signer",
@@ -3156,9 +3157,11 @@ dependencies = [
  "infra-postgres",
  "observability",
  "prometheus-client",
+ "reqwest",
  "sqlx",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

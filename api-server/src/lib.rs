@@ -5,7 +5,7 @@ pub mod handlers;
 pub mod metrics;
 pub mod middleware;
 pub mod state;
-pub mod webhook;
+pub mod webhooks;
 
 use crate::events::{receive_inbound_invoice, register_document_event};
 use crate::handlers::{create_invoice, create_payroll, create_support_document, get_document, health_check};
@@ -49,6 +49,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/documents/:id/events", post(register_document_event))
         .route("/payroll", post(create_payroll))
         .route("/support-documents", post(create_support_document))
+        .route("/webhooks", post(webhooks::create_webhook).get(webhooks::list_webhooks))
+        .route("/webhooks/:id", axum::routing::delete(webhooks::delete_webhook))
         .layer(from_fn_with_state(state.clone(), auth_middleware));
 
     let public_routes = Router::new().route("/health", get(health_check));

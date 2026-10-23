@@ -2,7 +2,7 @@
 
 use crate::jobs::{Job, NewJob};
 use crate::models::{
-    Certificate, DianEvent, Document, DocumentStatus, DocumentType, NumberingRange, Tenant,
+    Certificate, DianEvent, Document, DocumentStatus, DocumentType, NumberingRange, Tenant, Webhook,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -227,6 +227,45 @@ pub trait HealthProbe: Send + Sync {
     async fn ping(&self) -> Result<(), DomainError>;
 }
 
+/// Notificación pendiente de entrega, con los datos del destino.
+#[derive(Debug, Clone)]
+pub struct WebhookDelivery {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub event_type: String,
+    /// Datos del documento (`webhooks::notification_data`).
+    pub data: serde_json::Value,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub created_at: DateTime<Utc>,
+    pub target_url: String,
+    pub secret: String,
+    /// Si la suscripción sigue activa.
+    pub active: bool,
+}
+
+/// Suscripciones de webhooks y cola de entregas. Las entregas se encolan en la misma
+/// transacción que el cambio de estado que notifican (`DocumentRepository::apply_transition`).
+#[async_trait]
+pub trait WebhookRepository: Send + Sync {
+    async fn create_webhook(&self, webhook: Webhook) -> Result<(), DomainError>;
+    async fn list_webhooks(&self, tenant_id: Uuid) -> Result<Vec<Webhook>, DomainError>;
+    /// Borra la suscripción (y sus entregas pendientes). `false` si no existe para el tenant.
+    async fn delete_webhook(&self, tenant_id: Uuid, webhook_id: Uuid) -> Result<bool, DomainError>;
+
+    /// Reclama hasta `limit` entregas listas (o con lease vencido).
+    async fn claim_deliveries(&self, limit: i64, lease: Duration) -> Result<Vec<WebhookDelivery>, DomainError>;
+    async fn complete_delivery(&self, delivery_id: Uuid, status_code: u16) -> Result<(), DomainError>;
+    async fn retry_delivery(
+        &self,
+        delivery_id: Uuid,
+        run_at: DateTime<Utc>,
+        error: &str,
+        status_code: Option<u16>,
+    ) -> Result<(), DomainError>;
+    async fn bury_delivery(&self, delivery_id: Uuid, error: &str, status_code: Option<u16>) -> Result<(), DomainError>;
+}
+
 // ---------------------------------------------------------------------------------------
 // Servicios externos
 // ---------------------------------------------------------------------------------------
@@ -255,6 +294,13 @@ pub trait SignatureVerifier: Send + Sync {
     /// cubrirlo completo) y la cadena de confianza de su certificado. Una firma inválida o no
     /// confiable es `DomainError::Validation`.
     async fn verify(&self, xml: &str) -> Result<VerifiedSignature, DomainError>;
+}
+
+#[async_trait]
+pub trait WebhookSender: Send + Sync {
+    /// Envía `body` (JSON) por POST con las cabeceras dadas y devuelve el código HTTP. Un
+    /// destino no permitido o un fallo de red es un error.
+    async fn post(&self, url: &str, headers: &[(&str, String)], body: &str) -> Result<u16, DomainError>;
 }
 
 /// Marcador que el cliente SOAP coloca dentro de `wsse:Security` para que el firmador

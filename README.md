@@ -52,6 +52,7 @@ for f in $(ls migrations/*.sql | sort); do psql "$DATABASE_URL" -v ON_ERROR_STOP
 *   `20261021000000_harden_documents.sql` añade el estado `processing_failed`, distingue documentos emitidos y recibidos (`direction`, `issuer_nit`) en la clave única, y cambia el borrado en cascada de documentos y eventos por `ON DELETE RESTRICT`.
 *   `20261023000000_jobs_and_idempotency.sql` crea la cola de trabajos (`jobs`) y las claves de idempotencia (`idempotency_keys`), y asocia cada documento a su resolución de numeración. Si actualizas desde la versión con Redis, encola automáticamente los documentos que estaban en curso.
 *   `20261024000000_dead_jobs_index.sql` indexa la cola de errores (trabajos `dead`) para las métricas y la administración.
+*   `20261025000000_webhook_deliveries.sql` crea la cola de entregas de webhooks (`webhook_deliveries`) y restringe los tipos de evento suscribibles.
 
 ### Paso 2 (producción): llave de firma del tenant en Vault Transit
 La política del token debe permitir `read` en `<kv>/data/<ruta del tenant>` y `update` en `<transit>/sign/<llave del tenant>`; nada más. Para cada tenant:
@@ -214,16 +215,25 @@ El mismo endpoint emite `CreditNote` y `DebitNote` (UBL 2.1) con `document_type`
 
 ### B. Notificaciones de Estado mediante Webhooks
 
-> **Estado: aún no implementado.** La firma HMAC descrita abajo existe en el código (`api-server/src/webhook.rs`), pero todavía no se despacha ninguna notificación. Mientras tanto, consulta el estado con `GET /api/v1/documents/:id`.
+En lugar de consultar el estado de forma continua (*polling*), registra una URL y `Dian_Service` te enviará un `POST` cuando un documento llegue a un estado final.
 
-El objetivo es que, en lugar de forzar a tu ERP a hacer peticiones continuas (*polling*), `Dian_Service` envíe una petición HTTP POST a la URL de Webhook registrada en tu Tenant.
-
-#### Seguridad del Webhook (Verificación de Integridad):
-Para certificar que la notificación proviene de tu servidor y no de un tercero malintencionado, la API calcula una firma **HMAC-SHA256** del payload y la inyecta en la cabecera:
-
-`X-Hub-Signature-256: sha256={hash_hexadecimal_de_firma}`
-
-*Tu ERP debe calcular el hash del body recibido usando el `webhook_secret` compartido del Tenant y confirmar que coincide con la firma de la cabecera.*
+*   **Gestión (con API key):**
+    *   `POST /api/v1/webhooks` con `{ "target_url": "https://erp.example.com/hooks/dian", "event_type": "*" }` → `201` con el `secret` de firma (**solo se muestra en esta respuesta**).
+    *   `GET /api/v1/webhooks` lista las suscripciones (sin secretos). `DELETE /api/v1/webhooks/:id` borra una (y sus entregas pendientes).
+    *   `event_type`: `*` o uno de `document.accepted`, `document.rejected`, `document.contingency`, `document.failed`. Máximo 10 suscripciones por tenant.
+*   **Entrega:** las notificaciones se encolan en la misma transacción que el cambio de estado (no se pierden ni se adelantan) y las envía el worker. Cualquier respuesta distinta de `2xx`, un timeout (10 s) o un error de red se reintenta con espera exponencial (de 30 s hasta 1 h) hasta 10 intentos; después la entrega queda en estado `dead`.
+*   **Cuerpo:**
+```json
+{
+  "id": "6c1f...",
+  "event": "document.accepted",
+  "created_at": "2026-10-23T15:04:05Z",
+  "data": { "document_id": "fe9b...", "document_type": "invoice", "prefix": "FE", "number": 1002, "status": "dian_accepted", "cufe": "..." }
+}
+```
+*   **Verificación (obligatoria en tu ERP):** cada petición trae `X-Dian-Webhook-Id`, `X-Dian-Webhook-Event`, `X-Dian-Webhook-Timestamp` (segundos Unix) y `X-Dian-Webhook-Signature: v1=<hex>`, donde `<hex>` es `HMAC-SHA256(secret, "{timestamp}.{cuerpo}")` sobre el cuerpo tal como llega. Rechaza firmas que no coincidan (compáralas en tiempo constante) y timestamps con más de 5 minutos de diferencia; usa `id` para ignorar reintentos ya procesados.
+*   **Destinos permitidos (SSRF):** solo `https://` a hosts con direcciones públicas. La URL se valida al registrarla y el host se vuelve a resolver en cada envío: se rechaza si alguna dirección es privada, loopback, de enlace local (incluida `169.254.169.254`) o reservada, y la conexión se fija a la dirección verificada, sin proxy ni redirecciones. Solo para desarrollo: `WEBHOOK_ALLOW_HTTP=true` y `WEBHOOK_ALLOW_PRIVATE_NETWORKS=true` (en api-server y worker).
+*   **Pendiente:** el `secret` se guarda en claro en `webhooks.webhook_secret` (es necesario para firmar); protégelo con el cifrado en reposo de la base de datos.
 
 ---
 
@@ -354,7 +364,7 @@ Registra transacciones de compras realizadas a sujetos no obligados a facturar.
     *   El worker expone `/livez`, `/readyz` y `/metrics` en `METRICS_ADDR` (por defecto `0.0.0.0:9091`).
 *   **Métricas Prometheus (formato OpenMetrics):** la API las sirve en un listener aparte, `METRICS_ADDR` (por defecto `0.0.0.0:9090`; `off` lo desactiva), nunca en el puerto público.
     *   API: `dian_api_http_requests_total{method,route,status}` y `dian_api_http_request_duration_seconds{method,route}`; `route` es la plantilla (`/api/v1/documents/:id`), no la URL.
-    *   Worker: `dian_worker_jobs_total{kind,outcome}` (`handled`, `error`, `timeout`), `dian_worker_job_duration_seconds{kind}`, `dian_worker_jobs_in_flight`, `dian_worker_queue_jobs{state}` (`ready`, `scheduled`, `running`, `dead`) y `dian_worker_dian_breaker_open{environment}`.
+    *   Worker: `dian_worker_webhook_deliveries_total{outcome}` (`delivered`, `retried`, `dead`), `dian_worker_jobs_total{kind,outcome}` (`handled`, `error`, `timeout`), `dian_worker_job_duration_seconds{kind}`, `dian_worker_jobs_in_flight`, `dian_worker_queue_jobs{state}` (`ready`, `scheduled`, `running`, `dead`) y `dian_worker_dian_breaker_open{environment}`.
     *   Alertas sugeridas: `dian_worker_queue_jobs{state="dead"} > 0` (documentos en contingencia que requieren intervención), `dian_worker_queue_jobs{state="ready"}` creciendo sostenidamente (backlog), `dian_worker_dian_breaker_open == 1` durante más de unos minutos, y tasa de `5xx` en la API.
 *   **Logs:** una línea JSON por evento (`LOG_FORMAT=text` para formato legible; nivel con `RUST_LOG`). Cada petición HTTP registra método, ruta, estado, latencia, `request_id` y `tenant_id`; la cabecera `x-request-id` del cliente se propaga (o se genera) y se devuelve en la respuesta. Cada trabajo del worker registra `job_id`, `document_id`, `kind` y `attempt`.
 

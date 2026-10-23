@@ -16,6 +16,9 @@ dian-soap-client = { path = "../dian-soap-client" }
 observability = { path = "../observability" }
 prometheus-client = { workspace = true }
 axum = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+url = "2"
 tokio = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }

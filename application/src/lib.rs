@@ -6,6 +6,7 @@ pub mod issue;
 pub mod processing;
 pub mod radian;
 pub mod resilience;
+pub mod webhooks;
 pub mod xml;
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ use crate::config::ApiConfig;
 use application::inbound::InboundService;
 use application::issue::IssueService;
 use application::radian::RadianService;
+use application::webhooks::WebhookService;
 use core_domain::ports::{DocumentRepository, HealthProbe, TenantRepository};
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ pub struct AppState {
     pub issue: IssueService,
     pub inbound: InboundService,
     pub radian: RadianService,
+    pub webhooks: WebhookService,
     pub config: ApiConfig,
     pub metrics: Arc<crate::metrics::HttpMetrics>,
 }
