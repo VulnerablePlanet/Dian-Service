@@ -1,7 +1,7 @@
 //! Envío HTTP de webhooks con protección SSRF en el momento del envío:
 //! - el host se resuelve aquí y se rechaza si alguna de sus direcciones no es pública;
-//! - la conexión se fija a la dirección verificada (sin segunda resolución DNS que permita
-//!   "DNS rebinding") y no pasa por proxies;
+//! - la conexión se fija a las direcciones verificadas (sin segunda resolución DNS que
+//!   permita "DNS rebinding"), probándolas en orden, y no pasa por proxies;
 //! - no se siguen redirecciones (un 3xx es una entrega fallida).
 
 use async_trait::async_trait;
@@ -26,8 +26,9 @@ fn rejected(message: impl Into<String>) -> DomainError {
 }
 
 impl HttpWebhookSender {
-    /// Dirección verificada a la que se conectará.
-    async fn vetted_address(&self, url: &url::Url) -> Result<(Option<String>, SocketAddr), DomainError> {
+    /// Direcciones verificadas a las que se puede conectar (todas las resueltas: un host con
+    /// IPv6 e IPv4 debe poder usar la segunda si la primera no responde).
+    async fn vetted_addresses(&self, url: &url::Url) -> Result<(Option<String>, Vec<SocketAddr>), DomainError> {
         match url.scheme() {
             "https" => {}
             "http" if self.allow_http => {}
@@ -55,7 +56,7 @@ impl HttpWebhookSender {
                 return Err(rejected(format!("{} resolves to a non-public address ({})", url, internal.ip())));
             }
         }
-        Ok((domain, addresses[0]))
+        Ok((domain, addresses))
     }
 }
 
@@ -63,32 +64,42 @@ impl HttpWebhookSender {
 impl WebhookSender for HttpWebhookSender {
     async fn post(&self, target_url: &str, headers: &[(&str, String)], body: &str) -> Result<u16, DomainError> {
         let url = url::Url::parse(target_url).map_err(|e| rejected(e.to_string()))?;
-        let (domain, address) = self.vetted_address(&url).await?;
-
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent("Dian-Service-Webhooks/1");
-        if let Some(domain) = &domain {
-            builder = builder.resolve(domain, address);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| DomainError::Internal(format!("HTTP client: {}", e)))?;
-
-        let mut request = client.post(url).header("Content-Type", "application/json").body(body.to_string());
-        for (name, value) in headers {
-            request = request.header(*name, value);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| DomainError::Internal(format!("webhook request failed: {}", e)))?;
-        // El cuerpo de la respuesta no se lee: solo importa el código.
-        Ok(response.status().as_u16())
+        let (domain, addresses) = self.vetted_addresses(&url).await?;
+        send(url, domain.as_deref(), &addresses, headers, body).await
     }
+}
+
+/// Envía la petición conectando solo a `addresses` (ya verificadas) cuando el host es un dominio.
+async fn send(
+    url: url::Url,
+    domain: Option<&str>,
+    addresses: &[SocketAddr],
+    headers: &[(&str, String)],
+    body: &str,
+) -> Result<u16, DomainError> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent("Dian-Service-Webhooks/1");
+    if let Some(domain) = domain {
+        builder = builder.resolve_to_addrs(domain, addresses);
+    }
+    let client = builder
+        .build()
+        .map_err(|e| DomainError::Internal(format!("HTTP client: {}", e)))?;
+
+    let mut request = client.post(url).header("Content-Type", "application/json").body(body.to_string());
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| DomainError::Internal(format!("webhook request failed: {}", e)))?;
+    // El cuerpo de la respuesta no se lee: solo importa el código.
+    Ok(response.status().as_u16())
 }
 
 #[cfg(test)]
@@ -129,6 +140,21 @@ mod tests {
         assert!(request.starts_with("post /hooks"));
         assert!(request.contains("x-dian-webhook-id: abc"));
         assert!(request.contains("content-type: application/json"));
+    }
+
+    /// Caso del runner de CI: `localhost` resuelve primero a `::1`, donde no escucha nadie.
+    #[tokio::test]
+    async fn falls_back_to_the_next_vetted_address() {
+        let (url, request) = server("200 OK").await;
+        let url = url::Url::parse(&url).unwrap();
+        let port = url.port().unwrap();
+        let unreachable_first = [
+            SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port),
+            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port),
+        ];
+        let status = send(url, Some("localhost"), &unreachable_first, &[], "{}").await.unwrap();
+        assert_eq!(status, 200);
+        assert!(request.lock().unwrap().starts_with("POST /hooks"));
     }
 
     #[tokio::test]
