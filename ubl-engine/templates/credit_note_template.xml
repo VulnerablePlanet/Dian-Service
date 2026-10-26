@@ -1,0 +1,19 @@
+{%- import "macros.xml" as m -%}
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<CreditNote xmlns="urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2"
+            xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+            xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"
+            xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+            xmlns:ext="urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2">
+{{ m.extensions() }}
+{{ m.head(doc) }}
+    <cbc:CreditNoteTypeCode>{{ doc.type_code }}</cbc:CreditNoteTypeCode>
+    <cbc:DocumentCurrencyCode>COP</cbc:DocumentCurrencyCode>
+    <cbc:LineCountNumeric>{{ doc.lines | length }}</cbc:LineCountNumeric>
+{{ m.note_references(doc) }}
+{{ m.trade_party("AccountingSupplierParty", doc.supplier) }}
+{{ m.trade_party("AccountingCustomerParty", doc.customer) }}
+{{ m.tax_total(doc) }}
+{{ m.monetary_total("LegalMonetaryTotal", doc) }}
+{{ m.lines("CreditNoteLine", "CreditedQuantity", doc) }}
+</CreditNote>

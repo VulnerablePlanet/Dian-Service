@@ -1,8 +1,12 @@
 pub mod c14n;
 pub mod error;
 pub mod provider;
+pub mod signer;
 pub mod vault;
+pub mod verify;
 pub mod xades;
+pub mod wssec;
+pub mod xmlutil;
 
 use error::CryptoError;
 use provider::CertificateProvider;
@@ -21,82 +25,113 @@ pub async fn sign_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::{check_signature_structure, XmlSignatureVerifier};
     use provider::LocalCertificateProvider;
 
-    // A mock RSA private key in PKCS#8 PEM format for testing
-    const TEST_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC6N2Hsh5q/Z24G
-eJ+jP0U40j1W8o19W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbAgMBAAECggEBAJ5T1N6X9t39k23Xm+m74v6+M2376m3P2r6t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773gQKBgQDg73t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773t279s6773
-t279s6773t279s6773t279s6773t279s6773t279s6773gQKBgQDa97du/bOu+9
-7du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97
-du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97d
-u/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97gQKBgQDZ97du/bOu+97d
-u/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du
-/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/bOu+97du/
-bOu+97du/bOu+97du/bOu+97du/bOu+97gQKBgQC6N2Hsh5q/Z24GeJ+jP0U40j1
-W8o19W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-j22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvt
-Yvtj22LbAgECgYEAtjdt7Ieav2duBnifoz9FONI9VvKNfVvWNqOLgt979v9i+2L7
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22Lb
------END PRIVATE KEY-----
-"#;
+    // Pares de prueba desechables (ver tests/fixtures/README.md). Nunca usar en produccion.
+    const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/test_key.pem");
+    const TEST_CERT_PEM: &str = include_str!("../tests/fixtures/test_cert.pem");
+    const UNTRUSTED_KEY_PEM: &str = include_str!("../tests/fixtures/untrusted_key.pem");
+    const UNTRUSTED_CERT_PEM: &str = include_str!("../tests/fixtures/untrusted_cert.pem");
 
-    // A mock certificate PEM (contains public key matching private key above)
-    // For simplicity, we just use a placeholder certificate PEM since RSA local signing only uses the private key.
-    const TEST_CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
-MIIBpzCCAU+gAwIBAgIBADANBgkqhkiG9w0BAQsFADAKMQswCQYDVQQGEwJDTzAe
-Fw0yNjA1MjMwNTEzMjZaFw0yNzA1MjMwNTEzMjZaMAoxCzAJBgNVBAYTAmNPMIGf
-MA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC6N2Hsh5q/Z24GeJ+jP0U40j1W8o19
-W9Y2o4uC33v2/2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbAgMBAAEwDQYJKoZIhvcNAQELBQADgYEALjdt7Ieav2duBnifoz9FONI9
-VvKNfVvWNqOLgt979v9i+2L7Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
-Yvtj22LbYvtj22LbYvtj22LbYvtj22LbYvtj22Lb
------END CERTIFICATE-----
-"#;
+    /// Documento con namespace por defecto y prefijos declarados en la raíz, como las
+    /// plantillas UBL: los nodos firmados heredan esos namespaces.
+    const XML_INPUT: &str = concat!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?>"#,
+        "\n",
+        r#"<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" "#,
+        r#"xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" "#,
+        r#"xmlns:ds="http://www.w3.org/2000/09/xmldsig#" "#,
+        r#"xmlns:ext="urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2">"#,
+        "\n    <ext:UBLExtensions><ext:UBLExtension><ext:ExtensionContent>\n        ",
+        "<!-- PLACEHOLDER_FOR_SIGNATURE -->",
+        "\n    </ext:ExtensionContent></ext:UBLExtension></ext:UBLExtensions>\n",
+        r#"    <cbc:ID>FE1002</cbc:ID><cbc:Note>Caf&#233; &amp; t&#233; &lt;ok&gt;</cbc:Note>"#,
+        "\n</Invoice>\n"
+    );
+
+    fn provider(cert: &str, key: &str) -> LocalCertificateProvider {
+        LocalCertificateProvider::from_pem(cert.to_string(), key.to_string()).unwrap()
+    }
+
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
+    fn xmlsec1_available() -> bool {
+        std::process::Command::new("xmlsec1").arg("--version").output().is_ok()
+    }
+
+    async fn signed(cert: &str, key: &str) -> String {
+        sign_document(XML_INPUT, &provider(cert, key), "local").await.unwrap()
+    }
 
     #[tokio::test]
-    async fn test_sign_document_success() {
-        let provider = LocalCertificateProvider {
-            certificate_pem: TEST_CERT_PEM.to_string(),
-            private_key_pem: TEST_KEY_PEM.to_string(),
-        };
+    async fn signature_has_xades_structure_and_real_certificate_data() {
+        let xml = signed(TEST_CERT_PEM, TEST_KEY_PEM).await;
+        assert!(!xml.contains("PLACEHOLDER_FOR_SIGNATURE"));
+        assert!(xml.contains(xades::ALG_RSA_SHA256));
+        assert!(xml.contains(xades::ALG_C14N));
+        assert!(!xml.contains("sha384"), "algorithms must be consistent (SHA-256)");
+        assert!(xml.contains("CN=Dian-Service Test Root CA"), "real issuer name");
+        assert!(xml.contains("<xades:ClaimedRole>supplier</xades:ClaimedRole>"));
+        assert!(xml.contains(xades::POLICY_DIGEST_SHA256));
+        check_signature_structure(&xml).unwrap();
+    }
 
-        let xml_input = r#"<?xml version="1.0" encoding="UTF-8"?><Invoice><cbc:ID>FE1002</cbc:ID><!-- PLACEHOLDER_FOR_SIGNATURE --></Invoice>"#;
+    #[tokio::test]
+    async fn signature_verifies_with_xmlsec1_against_the_trusted_ca() {
+        if !xmlsec1_available() {
+            assert!(std::env::var_os("CI").is_none(), "xmlsec1 is required in CI");
+            eprintln!("xmlsec1 not installed: skipping independent signature verification");
+            return;
+        }
+        let xml = signed(TEST_CERT_PEM, TEST_KEY_PEM).await;
+        XmlSignatureVerifier::new(fixture("test_ca.pem")).verify(&xml).unwrap();
+    }
 
-        let result = sign_document(xml_input, &provider, "local_cert").await;
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn xmlsec1_rejects_tampering_and_untrusted_signers() {
+        if !xmlsec1_available() {
+            assert!(std::env::var_os("CI").is_none(), "xmlsec1 is required in CI");
+            eprintln!("xmlsec1 not installed: skipping independent signature verification");
+            return;
+        }
+        let verifier = XmlSignatureVerifier::new(fixture("test_ca.pem"));
+        let xml = signed(TEST_CERT_PEM, TEST_KEY_PEM).await;
 
-        let signed_xml = result.unwrap();
-        assert!(signed_xml.contains("<ds:Signature"));
-        assert!(signed_xml.contains("<ds:SignatureValue>"));
-        assert!(signed_xml.contains("<xades:SignedProperties"));
-        assert!(!signed_xml.contains("<!-- PLACEHOLDER_FOR_SIGNATURE -->"));
+        let tampered = xml.replace("<cbc:ID>FE1002</cbc:ID>", "<cbc:ID>FE9999</cbc:ID>");
+        assert!(verifier.verify(&tampered).is_err(), "modified content must fail");
+
+        let untrusted = signed(UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM).await;
+        assert!(verifier.verify(&untrusted).is_err(), "signer outside the trusted CA must fail");
+        XmlSignatureVerifier::new(fixture("untrusted_ca.pem")).verify(&untrusted).unwrap();
+    }
+
+    #[test]
+    fn structure_check_rejects_unsigned_partial_and_multiple_signatures() {
+        assert!(check_signature_structure("<a/>").is_err());
+        let partial = r##"<a xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><b Id="x"/><ds:Signature><ds:SignedInfo><ds:Reference URI="#x"/></ds:SignedInfo></ds:Signature></a>"##;
+        assert!(check_signature_structure(partial).unwrap_err().to_string().contains("whole document"));
+        let whole = r#"<ds:Signature><ds:SignedInfo><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms></ds:Reference></ds:SignedInfo></ds:Signature>"#;
+        let double = format!(r#"<a xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{whole}{whole}</a>"#);
+        assert!(check_signature_structure(&double).unwrap_err().to_string().contains("2 signatures"));
+    }
+
+    #[tokio::test]
+    async fn sign_document_rejects_invalid_certificate_or_missing_placeholder() {
+        /// Proveedor que entrega un certificado que no es X.509.
+        struct BrokenCertificate;
+        #[async_trait::async_trait]
+        impl CertificateProvider for BrokenCertificate {
+            async fn get_certificate(&self, _: &str) -> Result<String, CryptoError> {
+                Ok("Y2VydF9kdW1teQ==".to_string())
+            }
+            async fn sign_rsa_sha256(&self, _: &str, _: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                Ok(vec![0; 256])
+            }
+        }
+        assert!(sign_document(XML_INPUT, &BrokenCertificate, "local").await.is_err());
+        assert!(sign_document("<a/>", &self::provider(TEST_CERT_PEM, TEST_KEY_PEM), "local").await.is_err());
     }
 }

@@ -2,36 +2,38 @@
 resolver = "2"
 members = [
     "core-domain",
+    "infra-postgres",
+    "application",
     "ubl-engine",
     "crypto-signer",
     "dian-soap-client",
-    "worker-redis",
+    "worker",
     "api-server",
+    "observability",
 ]
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
+rust_decimal = "1.36"
 anyhow = "1.0"
 async-trait = "0.1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 minijinja = { version = "1.0", features = ["loader"] }
-xml-canonicalization = "0.1.1"
+quick-xml = "0.42"
+x509-cert = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 ring = "0.17"
-rsa = "0.9"
-zip = { version = "0.6", default-features = false, features = ["deflate"] }
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 axum = "0.7"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
-validator = { version = "0.18", features = ["derive"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id"] }
 hmac = "0.12.1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
-opentelemetry = "0.22"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+prometheus-client = "0.22"

@@ -1,0 +1,123 @@
+{#- Macros compartidas por las plantillas UBL. Todo valor interpolado se escapa (autoescape). -#}
+{% macro extensions() -%}
+    <ext:UBLExtensions>
+        <ext:UBLExtension>
+            <ext:ExtensionContent>
+                <!-- PLACEHOLDER_FOR_SIGNATURE -->
+            </ext:ExtensionContent>
+        </ext:UBLExtension>
+    </ext:UBLExtensions>
+{%- endmacro %}
+
+{% macro head(doc) -%}
+    <cbc:UBLVersionID>UBL 2.1</cbc:UBLVersionID>
+    <cbc:CustomizationID>{{ doc.customization_id }}</cbc:CustomizationID>
+    <cbc:ProfileID>DIAN 2.1</cbc:ProfileID>
+    <cbc:ProfileExecutionID>{{ doc.profile_execution_id }}</cbc:ProfileExecutionID>
+    <cbc:ID>{{ doc.id }}</cbc:ID>
+    <cbc:UUID schemeID="{{ doc.profile_execution_id }}" schemeName="{{ doc.uuid_scheme }}">{{ doc.uuid }}</cbc:UUID>
+    <cbc:IssueDate>{{ doc.issue_date }}</cbc:IssueDate>
+    <cbc:IssueTime>{{ doc.issue_time }}</cbc:IssueTime>
+{%- endmacro %}
+
+{% macro company_id(p) -%}
+<cbc:CompanyID schemeAgencyID="195" schemeAgencyName="CO, DIAN (Dirección de Impuestos y Aduanas Nacionales)"{% if p.check_digit %} schemeID="{{ p.check_digit }}"{% endif %} schemeName="{{ p.id_type }}">{{ p.id }}</cbc:CompanyID>
+{%- endmacro %}
+
+{% macro party_tax_scheme(p) -%}
+            <cac:PartyTaxScheme>
+                <cbc:RegistrationName>{{ p.name }}</cbc:RegistrationName>
+                {{ company_id(p) }}
+                <cac:TaxScheme>
+                    <cbc:ID>01</cbc:ID>
+                    <cbc:Name>IVA</cbc:Name>
+                </cac:TaxScheme>
+            </cac:PartyTaxScheme>
+{%- endmacro %}
+
+{#- AccountingSupplierParty / AccountingCustomerParty (SupplierPartyType / CustomerPartyType). -#}
+{% macro trade_party(tag, p) -%}
+    <cac:{{ tag }}>
+        <cbc:AdditionalAccountID>{{ p.id_type }}</cbc:AdditionalAccountID>
+        <cac:Party>
+            <cac:PartyName>
+                <cbc:Name>{{ p.name }}</cbc:Name>
+            </cac:PartyName>
+{{ party_tax_scheme(p) }}
+        </cac:Party>
+    </cac:{{ tag }}>
+{%- endmacro %}
+
+{#- SenderParty / ReceiverParty (PartyType: sin AdditionalAccountID ni cac:Party anidado). -#}
+{% macro plain_party(tag, p) -%}
+    <cac:{{ tag }}>
+{{ party_tax_scheme(p) }}
+    </cac:{{ tag }}>
+{%- endmacro %}
+
+{% macro tax_category(percent) -%}
+<cac:TaxCategory><cbc:Percent>{{ percent }}</cbc:Percent><cac:TaxScheme><cbc:ID>01</cbc:ID><cbc:Name>IVA</cbc:Name></cac:TaxScheme></cac:TaxCategory>
+{%- endmacro %}
+
+{% macro tax_total(doc) -%}
+    <cac:TaxTotal>
+        <cbc:TaxAmount currencyID="COP">{{ doc.tax }}</cbc:TaxAmount>
+{%- for s in doc.tax_subtotals %}
+        <cac:TaxSubtotal>
+            <cbc:TaxableAmount currencyID="COP">{{ s.taxable }}</cbc:TaxableAmount>
+            <cbc:TaxAmount currencyID="COP">{{ s.tax }}</cbc:TaxAmount>
+            {{ tax_category(s.percent) }}
+        </cac:TaxSubtotal>
+{%- endfor %}
+    </cac:TaxTotal>
+{%- endmacro %}
+
+{% macro monetary_total(tag, doc) -%}
+    <cac:{{ tag }}>
+        <cbc:LineExtensionAmount currencyID="COP">{{ doc.net }}</cbc:LineExtensionAmount>
+        <cbc:TaxExclusiveAmount currencyID="COP">{{ doc.net }}</cbc:TaxExclusiveAmount>
+        <cbc:TaxInclusiveAmount currencyID="COP">{{ doc.total }}</cbc:TaxInclusiveAmount>
+        <cbc:PayableAmount currencyID="COP">{{ doc.total }}</cbc:PayableAmount>
+    </cac:{{ tag }}>
+{%- endmacro %}
+
+{% macro lines(tag, quantity_tag, doc) -%}
+{%- for l in doc.lines %}
+    <cac:{{ tag }}>
+        <cbc:ID>{{ l.id }}</cbc:ID>
+        <cbc:{{ quantity_tag }} unitCode="{{ l.unit_code }}">{{ l.quantity }}</cbc:{{ quantity_tag }}>
+        <cbc:LineExtensionAmount currencyID="COP">{{ l.line_extension }}</cbc:LineExtensionAmount>
+        <cac:TaxTotal>
+            <cbc:TaxAmount currencyID="COP">{{ l.tax_amount }}</cbc:TaxAmount>
+            <cac:TaxSubtotal>
+                <cbc:TaxableAmount currencyID="COP">{{ l.line_extension }}</cbc:TaxableAmount>
+                <cbc:TaxAmount currencyID="COP">{{ l.tax_amount }}</cbc:TaxAmount>
+                {{ tax_category(l.tax_percent) }}
+            </cac:TaxSubtotal>
+        </cac:TaxTotal>
+        <cac:Item>
+            <cbc:Description>{{ l.description }}</cbc:Description>
+        </cac:Item>
+        <cac:Price>
+            <cbc:PriceAmount currencyID="COP">{{ l.unit_price }}</cbc:PriceAmount>
+            <cbc:BaseQuantity unitCode="{{ l.unit_code }}">1</cbc:BaseQuantity>
+        </cac:Price>
+    </cac:{{ tag }}>
+{%- endfor %}
+{%- endmacro %}
+
+{#- DiscrepancyResponse + BillingReference de las notas. -#}
+{% macro note_references(doc) -%}
+    <cac:DiscrepancyResponse>
+        <cbc:ReferenceID>{{ doc.billing_reference.number }}</cbc:ReferenceID>
+        <cbc:ResponseCode>{{ doc.discrepancy.code }}</cbc:ResponseCode>
+        <cbc:Description>{{ doc.discrepancy.description }}</cbc:Description>
+    </cac:DiscrepancyResponse>
+    <cac:BillingReference>
+        <cac:InvoiceDocumentReference>
+            <cbc:ID>{{ doc.billing_reference.number }}</cbc:ID>
+            <cbc:UUID schemeName="CUFE-SHA384">{{ doc.billing_reference.cufe }}</cbc:UUID>
+            <cbc:IssueDate>{{ doc.billing_reference.issue_date }}</cbc:IssueDate>
+        </cac:InvoiceDocumentReference>
+    </cac:BillingReference>
+{%- endmacro %}
